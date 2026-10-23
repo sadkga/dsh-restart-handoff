@@ -971,7 +971,10 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     }
     if (record?.live === true) {
       skipped.live += 1
-      console.error(`[restart-handoff] scan: ${id} skipped (already live)`)
+      // The session is up already, but a child of it may have been cut off by
+      // the same exit. Walk the children rather than skipping the whole tree.
+      const wokenChildren = await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
+      console.error(`[restart-handoff] scan: ${id} skipped (already live) woken=${wokenChildren.length}`)
       continue
     }
     if (alreadyResumed.includes(id)) {
