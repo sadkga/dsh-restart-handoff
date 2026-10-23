@@ -852,10 +852,15 @@ function balanceLog(events) {
  * @returns {{ cutOff: boolean, reason: string }} the verdict and its cause.
  */
 function cutOffReason(events) {
-  const list = balanceLog(events)
-  const starts = list.filter(event => event?.type === 'turn/start')
+  // The raw log decides the strongest fingerprint first: a turn that never
+  // ended is a cut-off whether or not the reader balanced it afterwards, and
+  // balancing would erase exactly that evidence.
+  const raw = Array.isArray(events) ? events : []
+  const began = raw.filter(event => event?.type === 'turn/start')
+  const closed = raw.filter(event => event?.type === 'turn/end')
+  if (began.length > closed.length) return { cutOff: true, reason: 'unclosed-turn' }
+  const list = balanceLog(raw)
   const ends = list.filter(event => event?.type === 'turn/end')
-  if (starts.length > ends.length) return { cutOff: true, reason: 'unclosed-turn' }
   const endReason = ends.at(-1)?.data?.reason
   if (endReason?.kind === 'interrupted') return { cutOff: true, reason: 'interrupted' }
   if (endReason?.kind === 'aborted' && endReason.reason?.kind === 'disposed') {
