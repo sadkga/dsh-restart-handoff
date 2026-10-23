@@ -590,57 +590,43 @@ function isRootSession(ctx, sessionId) {
  * carried 123, the difference being a client plugin and an MCP server that
  * were still coming up.
  *
- * The set is watched until it holds still. Waiting for it to be *complete*
- * would need the Host to publish what "complete" is; waiting for it to be
- * *stable* needs nothing but the Host's own registry, and it is the property
- * that actually matters — a session resumed against a settled registry gets
- * the same tools a fresh one would.
+ * The Host announces every change to its prompt registry with
+ * `system-prompt/change` — a documented public event, emitted when a section,
+ * context, tool provider or variable is registered or disposed. The wait
+ * listens for it and resumes only after the registry has been quiet for a
+ * moment. Waiting for the set to be *complete* would need the Host to
+ * publish what "complete" means; waiting for it to be *stable* needs only
+ * the Host's own announcement, and stability is the property that matters —
+ * a session resumed against a settled registry gets the tools a fresh one
+ * would get.
  * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
  * @param {number} budgetMs - how long to wait at most.
- * @returns {Promise<{ settled: boolean, providers: number, waitedMs: number }>} what was observed.
+ * @returns {Promise<{ settled: boolean, changes: number, waitedMs: number }>} what was observed.
  */
 async function waitForToolProviders(ctx, budgetMs) {
   const startedAt = Date.now()
-  const prompt = ctx.get('systemPrompt')
-  const count = () => {
-    const providers = prompt?.toolProviders
-    if (providers === undefined) return undefined
-    // The registry is an AnonymousEntries: it has `values()` and `isEmpty()`,
-    // but no `size` — reading `size` yields undefined and the wait would never
-    // see the set change. Counting the values is the only way to read it.
-    if (typeof providers.values === 'function') {
-      let total = 0
-      for (const _ of providers.values()) total += 1
-      return total
-    }
-    if (typeof providers.isEmpty === 'function') return providers.isEmpty() ? 0 : 1
-    return undefined
+  const quietMs = 600
+  let changes = 0
+  let lastChangeAt = startedAt
+  const onChange = () => {
+    changes += 1
+    lastChangeAt = Date.now()
   }
-  if (count() === undefined) {
-    // The Host does not publish the registry here; a flat wait is the best
-    // that can be done, and it says so rather than pretending it settled.
-    console.error(`[restart-handoff] no tool registry is visible (systemPrompt=${prompt === undefined ? 'absent' : 'present'})`)
-    await new Promise(resolve => { setTimeout(resolve, Math.max(0, budgetMs)) })
-    return { settled: false, providers: 0, waitedMs: Date.now() - startedAt }
-  }
-  let previous = count()
-  let stableRounds = 0
-  while (Date.now() - startedAt < budgetMs) {
-    await new Promise(resolve => { setTimeout(resolve, 200) })
-    const current = count()
-    if (current === previous) {
-      stableRounds += 1
-      // Two consecutive rounds without a change is enough: the plugins that
-      // register late do so within a second or two of the Host coming up.
-      if (stableRounds >= 2) {
-        return { settled: true, providers: current ?? 0, waitedMs: Date.now() - startedAt }
+  // The event is documented as part of the service's surface; a Host that
+  // does not publish it simply leaves the wait to its budget.
+  const subscribed = typeof ctx.on === 'function'
+  if (subscribed) ctx.on('system-prompt/change', onChange)
+  try {
+    while (Date.now() - startedAt < budgetMs) {
+      await new Promise(resolve => { setTimeout(resolve, 150) })
+      if (Date.now() - lastChangeAt >= quietMs) {
+        return { settled: true, changes, waitedMs: Date.now() - startedAt }
       }
-    } else {
-      stableRounds = 0
-      previous = current
     }
+  } finally {
+    if (subscribed && typeof ctx.off === 'function') ctx.off('system-prompt/change', onChange)
   }
-  return { settled: false, providers: previous ?? 0, waitedMs: Date.now() - startedAt }
+  return { settled: false, changes, waitedMs: Date.now() - startedAt }
 }
 /**
  * The registry-global archive set, when the profile publishes the workspace
@@ -2345,7 +2331,7 @@ export function apply(ctx, config = {}) {
       // the registry to settle costs a moment and removes the difference.
       void waitForToolProviders(ctx, Number(settings.resumeSettleMs ?? DEFAULTS.resumeSettleMs))
         .then((settled) => {
-          console.error(`[restart-handoff] tool providers ${settled.settled ? 'settled' : 'not settled'} after ${settled.waitedMs}ms (${settled.providers} registered)`)
+          console.error(`[restart-handoff] the prompt registry ${settled.settled ? 'settled' : 'did not settle'} after ${settled.waitedMs}ms (${settled.changes} change notifications)`)
           return runHandoff(ctx, settings)
         })
         .then((handoff) => recoverUnplannedSessions(ctx, settings, handoff ?? []))
