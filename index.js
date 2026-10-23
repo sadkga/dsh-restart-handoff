@@ -727,6 +727,102 @@ async function wakeTeamMembers(ctx, lead, record) {
 }
 
 /**
+ * Balanced view of a session log: no open turn at the tail.
+ *
+ * The Host balances a log before handing it to a reader — `cold-read` runs the
+ * same repair as an agent-loop resume — but the judgement must not depend on
+ * which reader it came through. A log whose last `turn/start` has no
+ * `turn/end` after it is closed here with a synthetic `interrupted` closer,
+ * exactly as `packages/core/session/src/repair.ts` does. The operation is
+ * idempotent: a log that is already balanced comes back unchanged.
+ * @param {object[]} events - the events of one session log, in order.
+ * @returns {object[]} the events, with the open tail turn closed.
+ */
+function balanceLog(events) {
+  const list = Array.isArray(events) ? events : []
+  const open = new Map()
+  for (const event of list) {
+    if (event?.type === 'turn/start') {
+      const turn = event?.data?.turn
+      if (turn !== undefined) open.set(turn, true)
+    } else if (event?.type === 'turn/end') {
+      const turn = event?.data?.turn
+      if (turn !== undefined) open.delete(turn)
+    }
+  }
+  if (open.size === 0) return list
+  const last = list.at(-1)
+  const time = typeof last?.time === 'number' ? last.time : Date.now()
+  let seq = typeof last?.seq === 'number' ? last.seq : -1
+  const closers = []
+  for (const turn of open.keys()) {
+    closers.push({ type: 'turn/end', seq: seq += 1, time, data: { turn, reason: { kind: 'interrupted' } } })
+  }
+  return [...list, ...closers]
+}
+
+/**
+ * Whether a session log was cut off mid-turn, and why.
+ *
+ * Four durable fingerprints, any one of which means the session was lost with
+ * work in flight:
+ *  - an unclosed turn (the last `turn/start` has no `turn/end`) — the writer
+ *    never got to close it;
+ *  - the last `turn/end` is `interrupted` — the session layer closed an
+ *    orphaned turn after the fact;
+ *  - the last `turn/end` is `aborted` with a `disposed` cause — the process
+ *    was torn down mid-turn;
+ *  - a committed `assistant/message` carrying `interrupted: true` — the model
+ *    was cut off mid-stream and the partial message is in the log.
+ *
+ * A turn the human stopped (`aborted` + `user`), one that finished
+ * (`completed`), one that failed (`error`) and one that hit the token ceiling
+ * (`max-tokens`) had nothing in flight and must stay dead.
+ * @param {object[]} events - the events of one session log.
+ * @returns {{ cutOff: boolean, reason: string }} the verdict and its cause.
+ */
+function cutOffReason(events) {
+  const list = balanceLog(events)
+  const starts = list.filter(event => event?.type === 'turn/start')
+  const ends = list.filter(event => event?.type === 'turn/end')
+  if (starts.length > ends.length) return { cutOff: true, reason: 'unclosed-turn' }
+  const endReason = ends.at(-1)?.data?.reason
+  if (endReason?.kind === 'interrupted') return { cutOff: true, reason: 'interrupted' }
+  if (endReason?.kind === 'aborted' && endReason.reason?.kind === 'disposed') {
+    return { cutOff: true, reason: 'aborted+disposed' }
+  }
+  const interruptedMessage = list.some(event => event?.type === 'assistant/message' && event?.data?.interrupted === true)
+  if (interruptedMessage) return { cutOff: true, reason: 'interrupted-message' }
+  return { cutOff: false, reason: endReason?.kind === undefined ? 'no-turn-end' : String(endReason.kind) }
+}
+
+/**
+ * Whether a subagent session was cut off, by its durable log.
+ *
+ * The log is read with `readSession`, which returns the complete event stream:
+ * `observeSession` hands back a SEED view (a handful of events ending in
+ * `session/end-seed`), so a judgement built on it would be watching a
+ * different conversation. The read is balanced locally as well, which makes
+ * the verdict independent of whether the Host already balanced it.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {string} sessionId - the child session.
+ * @returns {Promise<{ cutOff: boolean, reason: string }>} the verdict and its cause.
+ */
+async function wasSessionCutOff(ctx, sessionId) {
+  const query = ctx.get('sessionQuery')
+  if (query === undefined) return { cutOff: false, reason: 'no-session-query' }
+  try {
+    const snapshot = await query.readSession(sessionId)
+    const events = snapshot?.events
+    if (!Array.isArray(events)) return { cutOff: false, reason: 'unreadable' }
+    return cutOffReason(events)
+  } catch (error) {
+    console.error(`[restart-handoff] could not read the session ${sessionId}:`, error)
+    return { cutOff: false, reason: 'read-failed' }
+  }
+}
+
+/**
  * Recover the sessions a crashed process left behind.
  *
  * A planned restart leaves a handoff record. A crash, a kill, or any other
@@ -765,39 +861,54 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     if (record?.header?.parentSession !== undefined) continue
     if (record?.live === true) continue
     if (alreadyResumed.includes(id)) continue
-    let observation
+    // The log is read with `readSession`, not `observeSession`: the latter
+    // returns a SEED view (a few events ending in `session/end-seed`), so a
+    // judgement built on it inspects the wrong conversation. The cause is
+    // balanced locally too, which keeps the verdict independent of the reader.
+    let events
     try {
-      observation = await query.observeSession(id)
-    } catch {
+      const snapshot = await query.readSession(id)
+      events = Array.isArray(snapshot?.events) ? snapshot.events : []
+    } catch (error) {
+      console.error(`[restart-handoff] could not read the session ${id}:`, error)
       continue
     }
-    const ends = observation?.events?.filter(event => event.type === 'turn/end') ?? []
-    const endReason = ends.at(-1)?.data?.reason
-    // The durable fingerprint is the last turn's ENDING. `interrupted` is the
-    // closer the session layer appends for a log whose tail turn never ended
-    // — both on resume and on a cold read, so this one judgement covers a
-    // session that was never resumed AND one that was. `aborted` with a
-    // `disposed` cause is the teardown path. A turn the human stopped
-    // (`aborted` + `user`), a turn that finished (`completed`) and a turn that
-    // failed (`error`) had nothing in flight and must stay dead.
-    const wasCutOff = endReason?.kind === 'interrupted'
-      || (endReason?.kind === 'aborted' && endReason.reason?.kind === 'disposed')
+    const cutOff = cutOffReason(events)
+    const wasCutOff = cutOff.cutOff
+    // The inbox projection is the one thing the observation is still good
+    // for: it is the durable record of accepted-but-unstarted work.
+    let inboxState
+    try {
+      const observation = await query.observeSession(id)
+      inboxState = observation?.projections?.values?.inbox
+      observation?.[Symbol.dispose]?.()
+    } catch {
+      inboxState = undefined
+    }
     // A queued prompt that never started is work in flight too: the turn it
     // belonged to may have finished, but the accepted work is still waiting
     // and would be lost with the process.
-    const inboxState = observation?.projections?.values?.inbox
     const queued = (inboxState?.['next-turn']?.length ?? 0) > 0
       || (inboxState?.['next-step']?.length ?? 0) > 0
-    const lastEvent = observation?.events?.[observation.events.length - 1]
-    if (typeof lastEvent?.time === 'number' && Date.now() - lastEvent.time > maxAgeMs) continue
-    if (!wasCutOff && !queued) continue
+    const lastEvent = events.at(-1)
+    if (typeof lastEvent?.time === 'number' && Date.now() - lastEvent.time > maxAgeMs) {
+      console.error(`[restart-handoff] scan: ${id} skipped (older than the window)`)
+      continue
+    }
+    if (!wasCutOff && !queued) {
+      console.error(`[restart-handoff] scan: ${id} skipped (finished: ${cutOff.reason})`)
+      continue
+    }
     if (recovered.length >= maxSessions) break
     const agent = await resumeSession(ctx, id)
-    if (agent === undefined) continue
+    if (agent === undefined) {
+      console.error(`[restart-handoff] scan: ${id} NOT RESTORED (resume failed)`)
+      continue
+    }
     agent.followup(userMessage('The Harness process went down unexpectedly and your session was resumed. Continue the work that was in flight.'))
-    await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
+    const woken = await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
     recovered.push(id)
-    console.error(`[restart-handoff] recovered the interrupted session ${id}`)
+    console.error(`[restart-handoff] scan: ${id} restored (${cutOff.cutOff ? cutOff.reason : 'queued-work'}) woken=${woken.length}`)
   }
   console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length}`)
   return recovered

@@ -211,6 +211,7 @@ test('an interrupted session is recovered on an unplanned exit', async () => {
         return {
           listSessions: async () => [{ id: 's-crashed', header: { id: 's-crashed' }, live: false }],
           observeSession: async () => ({ events: [{ type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'disposed' } } } }], projections: { values: {} } }),
+          readSession: async () => ({ events: [{ type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'disposed' } } } }] }),
         }
       }
       if (name === 'agents') {
@@ -241,6 +242,7 @@ test('a session the handoff already resumed is not recovered twice', async () =>
         return {
           listSessions: async () => [{ id: 's-done', header: { id: 's-done' }, live: false }],
           observeSession: async () => ({ events: [{ type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'disposed' } } } }], projections: { values: {} } }),
+          readSession: async () => ({ events: [{ type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'disposed' } } } }] }),
         }
       }
       if (name === 'agents') return { get: () => undefined, resume: async (o) => { calls.resumed.push(o); return { agent: {} } } }

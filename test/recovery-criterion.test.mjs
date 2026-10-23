@@ -42,6 +42,10 @@ function scanCtx(observations) {
             live: false,
           })),
           observeSession: async (id) => byId.get(id)?.observation,
+          // The judgement reads the COMPLETE log, not the seed view. The double
+          // returns the same events, which is what the real `readSession` does
+          // for a balanced log; `cutOffReason` balances locally either way.
+          readSession: async (id) => ({ session: { id }, events: byId.get(id)?.observation?.events ?? [] }),
         }
       }
       if (name === 'agents') {
@@ -217,6 +221,7 @@ test('criterion: a live session is not touched', async () => {
         return {
           listSessions: async () => [{ id: 's1', header: { id: 's1' }, live: true }],
           observeSession: async () => ({ events: [], projections: { values: {} } }),
+          readSession: async () => ({ events: [] }),
         }
       }
       return ctx.get(name)
@@ -239,6 +244,7 @@ test('criterion: a child session is not scanned', async () => {
         return {
           listSessions: async () => [{ id: 's1', header: { id: 's1', parentSession: 'root' }, live: false }],
           observeSession: async () => ({ events: [], projections: { values: {} } }),
+          readSession: async () => ({ events: [] }),
         }
       }
       return ctx.get(name)
