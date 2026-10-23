@@ -16,7 +16,7 @@ const { DEFAULTS, HANDOFF_FILE, PENDING_FILE, readRecord, resumeSession, runHand
 
 /**
  * A host double for the replay path.
- * @param {{ events?: object[], projections?: object, resumeError?: Error, live?: object, mountFails?: boolean }} options - the doubles' behaviour.
+ * @param {{ events?: object[], projections?: object, sessions?: object[], resumeError?: Error, live?: object, mountFails?: boolean }} options - the doubles' behaviour.
  * @returns {{ ctx: Record<string, any>, calls: Record<string, any[]> }} the fake context and the recorded calls.
  */
 function replayCtx(options = {}) {
@@ -25,10 +25,18 @@ function replayCtx(options = {}) {
     get(name) {
       if (name === 'sessionQuery') {
         return {
+          // The scan walks the whole roster; without this it has nothing to
+          // look at and every assertion below would pass vacuously.
+          listSessions: async () => options.sessions ?? [],
           observeSession: async () => ({
             events: options.events ?? [],
             projections: { values: options.projections ?? {} },
           }),
+          // The cut-off criterion reads the FULL log; `observeSession` only
+          // ever returns a seed view. Without this the criterion sees nothing
+          // and a test can pass while the behaviour it claims to check never
+          // happened.
+          readSession: async () => ({ events: options.events ?? [] }),
         }
       }
       if (name === 'agents') {
@@ -40,6 +48,11 @@ function replayCtx(options = {}) {
             if (options.resumeError !== undefined) throw options.resumeError
             // The real registry runs the setup hook on the agent's context.
             if (opts.setup !== undefined) await opts.setup({}, { id: opts.resumeSessionId })
+            // A live agent and the one the resume returns are the SAME agent in
+            // the real Host: the resume hands back the resident one. The scan
+            // later looks the session up with `get`, so a double here would
+            // hide a duplicate delivery.
+            if (options.live !== undefined) return { agent: options.live }
             return {
               agent: {
                 id: opts.resumeSessionId,
@@ -211,8 +224,7 @@ test('a teammate is woken once, by the Team path', async () => {
   assert.equal(calls.messaged[0].target, 'cap-models')
 })
 
-test('an interrupted session is recovered on an unplanned exit', async () => {
-  const calls = { resumed: [], followups: [] }
+test('an interrupted session is recovered on an unplanned exit', async () => {  const calls = { resumed: [], followups: [] }
   const ctx = {
     get(name) {
       if (name === 'sessionQuery') {
@@ -332,7 +344,8 @@ test('a handoff record naming no real session is dropped, not retried forever', 
     },
   }
   const resumed = await runHandoff(ctx, settings)
-  assert.deepEqual(resumed, [])
+  assert.deepEqual(resumed.resumed, [])
+  assert.deepEqual(resumed.nudged, [])
   assert.equal(await readRecord(settings, HANDOFF_FILE), undefined, 'the record must be gone')
   await rm(dir, { recursive: true, force: true })
 })
@@ -351,7 +364,102 @@ test('a handoff record that resumes at least one session is kept to completion',
   }), 'utf8')
   const { ctx, calls } = replayCtx()
   const resumed = await runHandoff(ctx, settings)
-  assert.deepEqual(resumed, ['s-good'])
+  // The result is the ledger the scan consults: which sessions were resumed,
+  // which of them actually received their continue instruction, and which
+  // children were woken with them.
+  assert.deepEqual(resumed.resumed, ['s-good'])
+  assert.deepEqual(resumed.nudged, ['s-good'])
+  assert.deepEqual(resumed.children, [])
   assert.equal(calls.resumed.length, 1)
   await rm(dir, { recursive: true, force: true })
+})
+
+test('a planned restart delivers ONE continue instruction, not two', async () => {
+  // The bug this covers: the replay resumes a session, which makes it LIVE,
+  // and its log still shows the turn the replay is answering — the fresh turn
+  // is not finished yet. The scan that runs afterwards therefore sees a live
+  // session with an unclosed turn and wakes it AGAIN, so the user gets two
+  // "continue" prompts for one restart. Observed in production.
+  const { dir, settings } = await fixture()
+  await writeFile(join(dir, HANDOFF_FILE), JSON.stringify({
+    phase: 'prepared',
+    sessionId: 's-planned',
+    sessions: [{ id: 's-planned', kind: 'initiator' }],
+    reason: 'because',
+    continuePrompt: 'carry on',
+    resumeSubagents: false,
+    createdAt: Date.now(),
+    createdByPid: 1,
+  }), 'utf8')
+
+  // One agent that serves both paths: the replay resumes it, and the scan
+  // then finds it live. Its log keeps an unclosed turn the whole time, which
+  // is what made the scan wake it a second time.
+  const followups = []
+  const agent = {
+    id: 's-planned',
+    status: 'idle',
+    inbox: { nextTurn: [], nextStep: [] },
+    session: { header: { id: 's-planned', cwd: '/tmp' } },
+    followup: (message) => followups.push(message),
+  }
+  const unclosed = [{
+    type: 'turn/start',
+    data: { turn: 1 },
+  }]
+  const { ctx, calls } = replayCtx({
+    live: agent,
+    events: unclosed,
+    sessions: [{ id: 's-planned', header: { id: 's-planned' }, live: true }],
+    projections: { values: {} },
+  })
+
+  // 1. the replay resumes it and delivers its instruction
+  const ledger = await runHandoff(ctx, settings)
+  assert.deepEqual(ledger.resumed, ['s-planned'])
+  assert.deepEqual(ledger.nudged, ['s-planned'])
+  const afterReplay = followups.length
+  assert.equal(afterReplay, 1, 'the replay delivers the continue instruction once')
+
+  // 2. the scan runs over the same session, now live, with the unclosed turn
+  //    still in its log
+  const { recoverUnplannedSessions } = internals
+  const recovered = await recoverUnplannedSessions(ctx, { ...settings }, ledger)
+  assert.deepEqual(recovered, [], 'the session is not recovered a second time')
+  assert.equal(followups.length, afterReplay, 'the session is NOT told to continue twice')
+  assert.equal(calls.resumed.length, 1, 'the session is not resumed twice')
+
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a live session the handoff did NOT resume is still told to continue', async () => {
+  // The other side of the same rule: a human who opened the conversation
+  // right after the crash makes it live, and it was never nudged by the
+  // replay. That one MUST get the instruction, or the work stays parked.
+  const followups = []
+  const agent = {
+    id: 's-human',
+    status: 'idle',
+    inbox: { nextTurn: [], nextStep: [] },
+    session: { header: { id: 's-human', cwd: '/tmp' } },
+    followup: (message) => followups.push(message),
+  }
+  const unclosed = [{ type: 'turn/start', data: { turn: 1 } }]
+  const ctx = {
+    get(name) {
+      if (name === 'sessionQuery') {
+        return {
+          listSessions: async () => [{ id: 's-human', header: { id: 's-human' }, live: true }],
+          observeSession: async () => ({ events: unclosed, projections: { values: {} } }),
+          readSession: async () => ({ events: unclosed }),
+        }
+      }
+      if (name === 'agents') return { get: (id) => (id === 's-human' ? agent : undefined), resume: async () => ({ agent }) }
+      return undefined
+    },
+    sessionPersistence: { flush: async () => {} },
+  }
+  const { recoverUnplannedSessions } = internals
+  await recoverUnplannedSessions(ctx, { ...DEFAULTS }, { resumed: [], nudged: [], children: [] })
+  assert.equal(followups.length, 1, 'a live session nobody nudged must still be told to continue')
 })

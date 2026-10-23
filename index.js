@@ -601,26 +601,29 @@ async function resumeSession(ctx, sessionId) {
  * @returns {Promise<void>} resolves when the handoff is done or skipped.
  */
 async function runHandoff(ctx, settings) {
+  // Every path returns the same shape — the ledger the scan consults — so a
+  // caller never has to guess whether it got an array or an object.
+  const nothing = { resumed: [], nudged: [], children: [] }
   // A confirmation never survives the restart it was meant to authorize: the
   // fresh process has no pending warning for the model to confirm against.
   await clearRecord(settings, PENDING_FILE)
 
   const record = await readRecord(settings, HANDOFF_FILE)
-  if (record === undefined) return
+  if (record === undefined) return nothing
   if (record.phase === 'resumed') {
     await clearRecord(settings, HANDOFF_FILE)
-    return
+    return nothing
   }
   const age = Date.now() - Number(record.createdAt ?? 0)
   if (!Number.isFinite(age) || age < 0 || age > Number(settings.handoffTtlMs ?? DEFAULTS.handoffTtlMs)) {
     console.error('[restart-handoff] stale handoff record, not replaying it')
     await clearRecord(settings, HANDOFF_FILE)
-    return
+    return nothing
   }
   if (record.createdByPid === process.pid) {
     // The same process wrote it and never went away: the restart did not happen.
     console.error('[restart-handoff] handoff record belongs to this process, not replaying it')
-    return
+    return nothing
   }
 
   const entries = Array.isArray(record.sessions) && record.sessions.length > 0
@@ -630,6 +633,8 @@ async function runHandoff(ctx, settings) {
   const intro = `The Harness restarted (${reason}).`
 
   const resumed = []
+  const nudgedSessions = []
+  const wokenChildren = []
   for (const entry of entries) {
     const sessionId = String(entry.id ?? '')
     if (sessionId === '') continue
@@ -645,6 +650,7 @@ async function runHandoff(ctx, settings) {
     if (record.resumeSubagents === true) {
       woken = await wakeSubagents(ctx, sessionId, record)
     }
+    for (const childId of woken) wokenChildren.push(childId)
 
     const text = entry.kind === 'peer'
       ? `${intro} Your session was resumed and the other running sessions were resumed too. Continue the work you had in flight.`
@@ -655,6 +661,8 @@ async function runHandoff(ctx, settings) {
     const delivery = await deliverContinue(agent, text)
     if (!delivery.claimed) {
       console.error(`[restart-handoff] WARNING: the handoff instruction was not claimed for ${sessionId}: ${delivery.reason}`)
+    } else {
+      nudgedSessions.push(sessionId)
     }
     // The fate of one planned session, on its own line: it was resumed, and
     // this is how many of its subagents were woken. A restored parent whose
@@ -677,12 +685,29 @@ async function runHandoff(ctx, settings) {
     // handoff this plugin can honour, so it is dropped rather than kept.
     console.error('[restart-handoff] the handoff record names no resumable session, dropping it')
     await clearRecord(settings, HANDOFF_FILE)
-    return []
+    // The same shape as the ledger below, so a caller never has to guess
+    // whether it got an array or an object.
+    return { resumed: [], nudged: [], children: [] }
   }
 
   await writeRecord(settings, HANDOFF_FILE, { ...record, phase: 'resumed', resumedAt: Date.now() })
   await clearRecord(settings, HANDOFF_FILE)
-  return resumed.map(entry => entry.agent.id)
+  // The ledger travels with the result, because the scan that runs after this
+  // needs to know what was ALREADY delivered. The replay resumes a session,
+  // which makes it live; by the time the scan reaches it, the log still shows
+  // the turn this delivery is answering — the fresh turn is not finished — so
+  // the scan would see a live session with work in flight and wake it a
+  // second time. The user would get two "continue" instructions for one
+  // restart.
+  //
+  // Only deliveries that were actually CLAIMED are recorded, so a failed one
+  // can still be retried by the scan: the duplicate is prevented, the
+  // recovery is not.
+  return {
+    resumed: resumed.map(entry => entry.agent.id),
+    nudged: nudgedSessions,
+    children: wokenChildren,
+  }
 }
 
 /**
@@ -701,7 +726,7 @@ async function runHandoff(ctx, settings) {
  * @param {Record<string, any>} record - the handoff record.
  * @returns {Promise<string[]>} the ids of the woken subagents.
  */
-async function wakeSubagents(ctx, sessionId, record) {
+async function wakeSubagents(ctx, sessionId, record, alreadyWoken = new Set()) {
   const subagents = ctx.get('subagents')
   if (subagents === undefined) return []
   const descendants = await listSubagents(ctx, sessionId)
@@ -718,6 +743,14 @@ async function wakeSubagents(ctx, sessionId, record) {
     .sort((left, right) => (left.depth ?? 0) - (right.depth ?? 0))
   const woken = []
   for (const child of candidates) {
+    // A child that was already woken this boot — by the handoff replay, before
+    // the scan got here — must not be woken twice. It is live now and its log
+    // still shows the turn that delivery is answering, so the criterion would
+    // say "cut off" again.
+    if (alreadyWoken.has(child.id)) {
+      console.error(`[restart-handoff] subagent ${child.id} left asleep (already woken this boot)`)
+      continue
+    }
     const cutOff = await wasSessionCutOff(ctx, child.id)
     if (!cutOff.cutOff) {
       console.error(`[restart-handoff] subagent ${child.id} left asleep (${cutOff.reason}, mode=${child.mode})`)
@@ -1524,11 +1557,25 @@ async function mapBounded(items, concurrency, task) {
  * never started, which is work in flight as well.
  * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
  * @param {Record<string, any>} settings - effective plugin settings.
- * @param {string[]} [alreadyResumed] - the sessions the handoff already resumed.
+ * @param {string[] | { resumed?: string[], nudged?: string[], children?: string[] }} [handoff] -
+ *   what the handoff replay already did. An array is the older shape and means
+ *   "these sessions were resumed" with nothing else recorded.
  * @returns {Promise<string[]>} the ids of the recovered sessions.
  */
-async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
+async function recoverUnplannedSessions(ctx, settings, handoff = []) {
   if (settings.recoverInterruptedSessions === false) return []
+  // The replay and this scan are independent paths that can both decide the
+  // same session needs waking. The replay runs first and RESUMES the session,
+  // which makes it live; by the time this scan reaches it, the log still shows
+  // the turn that delivery is answering — the fresh turn is not finished — so
+  // the criterion says "cut off" and the session would be woken a second time.
+  // The user would get two "continue" instructions for one restart.
+  //
+  // Only deliveries that were actually claimed are in `nudged`, so a failed
+  // one is still retried here: the duplicate is prevented, the recovery is not.
+  const alreadyResumed = Array.isArray(handoff) ? handoff : (handoff?.resumed ?? [])
+  const alreadyNudged = new Set(Array.isArray(handoff) ? [] : (handoff?.nudged ?? []))
+  const alreadyWokenChildren = new Set(Array.isArray(handoff) ? [] : (handoff?.children ?? []))
   const query = ctx.get('sessionQuery')
   if (query === undefined) return []
   let records = []
@@ -1668,7 +1715,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       // scan runs. So the log still decides whether this session has work in
       // flight, and the wake-up is delivered either way.
       const liveAgent = ctx.get('agents')?.get?.(id)
-      const wokenChildren = await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
+      const wokenChildren = await wakeSubagents(ctx, id, { reason: 'unexpected restart' }, alreadyWokenChildren)
       const wokenTeammates = await wakeTeamMembers(ctx, liveAgent, { reason: 'unexpected restart' })
       let nudged = false
       // The log decides, and it is read through the same helper the subagent
@@ -1676,6 +1723,16 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       // context there silently yields `{ cutOff: false }` and the nudge would
       // never fire while the log looked perfectly healthy.
       const verdict = await wasSessionCutOff(ctx, id)
+      if (alreadyNudged.has(id)) {
+        // The handoff replay already delivered this session's continue
+        // instruction. Its log still shows the turn that instruction is
+        // answering — the fresh turn is not finished yet — so the criterion
+        // above says "cut off" and would deliver a SECOND instruction for the
+        // same restart. The user would see two "continue" prompts.
+        // The Team wake above still runs: the replay never woke teammates.
+        console.error(`[restart-handoff] scan: ${id} skipped (already live, continue already delivered this boot) woken=${wokenChildren.length} teammates=${wokenTeammates.length}`)
+        continue
+      }
       if (verdict.cutOff && liveAgent !== undefined && typeof liveAgent.followup === 'function') {
         try {
           // NOT a bare `followup()`: a wake sent while the driver is live but
@@ -1756,7 +1813,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     if (!delivery.claimed) {
       console.error(`[restart-handoff] WARNING: the recovery instruction was not claimed for ${id}: ${delivery.reason}`)
     }
-    const woken = await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
+    const woken = await wakeSubagents(ctx, id, { reason: 'unexpected restart' }, alreadyWokenChildren)
     // A teammate is not a subagent: the Team roster owns it, and it is woken
     // through the Team path. The handoff replay has always done this; the
     // unplanned-exit scan used to forget it, which left every teammate of the
@@ -2057,7 +2114,7 @@ export function apply(ctx, config = {}) {
   if (settings.autoResume !== false) {
     ctx.effect(() => {
       void runHandoff(ctx, settings)
-        .then((ids) => recoverUnplannedSessions(ctx, settings, ids ?? []))
+        .then((handoff) => recoverUnplannedSessions(ctx, settings, handoff ?? []))
         .catch((error) => {
           console.error('[restart-handoff] handoff or unplanned recovery failed:', error)
         })
