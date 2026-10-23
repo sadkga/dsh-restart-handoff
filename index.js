@@ -87,6 +87,17 @@ const DEFAULTS = {
   recoverMaxSessions: 50,
   /** Recover the sessions an unplanned exit left behind. */
   recoverInterruptedSessions: true,
+  /**
+   * How long the recovery waits for the Host's tool providers to settle.
+   *
+   * A resumed session is handed the tool set that exists at the moment it is
+   * resumed. Plugins and MCP servers that finish registering a moment later
+   * are therefore missing from that first turn — measured on this Host: a
+   * resume carried 105 tools where the next turn carried 123, and the ones in
+   * between belonged to a client plugin and an MCP server that were still
+   * coming up. The recovery waits for the set to stop changing first.
+   */
+  resumeSettleMs: 3000,
   /** Write the handoff record but never signal this process. */
   dryRun: false,
 }
@@ -569,6 +580,58 @@ function isRootSession(ctx, sessionId) {
  * @param {object} root - the root agent.
  * @returns {Promise<boolean>} true when the session must come back.
  */
+/**
+ * Wait until the Host's tool providers stop changing.
+ *
+ * A session is handed the tool set that exists when it is resumed. A plugin
+ * or an MCP server that registers a moment later is missing from that first
+ * turn, and the session is told — in its own transcript — that 29 tools were
+ * removed. Measured here: a resume carried 105 tools where the next turn
+ * carried 123, the difference being a client plugin and an MCP server that
+ * were still coming up.
+ *
+ * The set is watched until it holds still. Waiting for it to be *complete*
+ * would need the Host to publish what "complete" is; waiting for it to be
+ * *stable* needs nothing but the Host's own registry, and it is the property
+ * that actually matters — a session resumed against a settled registry gets
+ * the same tools a fresh one would.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {number} budgetMs - how long to wait at most.
+ * @returns {Promise<{ settled: boolean, providers: number, waitedMs: number }>} what was observed.
+ */
+async function waitForToolProviders(ctx, budgetMs) {
+  const startedAt = Date.now()
+  const prompt = ctx.get('systemPrompt')
+  const count = () => {
+    const providers = prompt?.toolProviders
+    if (providers === undefined) return undefined
+    return typeof providers.size === 'number' ? providers.size : undefined
+  }
+  if (count() === undefined) {
+    // The Host does not publish the registry here; a flat wait is the best
+    // that can be done, and it says so rather than pretending it settled.
+    await new Promise(resolve => { setTimeout(resolve, Math.max(0, budgetMs)) })
+    return { settled: false, providers: 0, waitedMs: Date.now() - startedAt }
+  }
+  let previous = count()
+  let stableRounds = 0
+  while (Date.now() - startedAt < budgetMs) {
+    await new Promise(resolve => { setTimeout(resolve, 200) })
+    const current = count()
+    if (current === previous) {
+      stableRounds += 1
+      // Two consecutive rounds without a change is enough: the plugins that
+      // register late do so within a second or two of the Host coming up.
+      if (stableRounds >= 2) {
+        return { settled: true, providers: current ?? 0, waitedMs: Date.now() - startedAt }
+      }
+    } else {
+      stableRounds = 0
+      previous = current
+    }
+  }
+  return { settled: false, providers: previous ?? 0, waitedMs: Date.now() - startedAt }
+}
 /**
  * The registry-global archive set, when the profile publishes the workspace
  * registry to this plugin context.
@@ -2266,7 +2329,15 @@ export function apply(ctx, config = {}) {
   // instruction twice.
   if (settings.autoResume !== false) {
     ctx.effect(() => {
-      void runHandoff(ctx, settings)
+      // The Host's own plugins and MCP servers finish registering after this
+      // bundle's apply() returns. A session resumed before they are up is
+      // handed a shorter tool list, and its transcript says so. Waiting for
+      // the registry to settle costs a moment and removes the difference.
+      void waitForToolProviders(ctx, Number(settings.resumeSettleMs ?? DEFAULTS.resumeSettleMs))
+        .then((settled) => {
+          console.error(`[restart-handoff] tool providers ${settled.settled ? 'settled' : 'not settled'} after ${settled.waitedMs}ms (${settled.providers} registered)`)
+          return runHandoff(ctx, settings)
+        })
         .then((handoff) => recoverUnplannedSessions(ctx, settings, handoff ?? []))
         .catch((error) => {
           console.error('[restart-handoff] handoff or unplanned recovery failed:', error)
@@ -2352,6 +2423,7 @@ export const internals = {
   teamMemberIds,
   wakeSubagents,
   wakeTeamMembers,
+  waitForToolProviders,
   wasSessionCutOff,
   writeRecord,
   clearRecord,

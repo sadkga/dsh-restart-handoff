@@ -10,3 +10,6 @@
         recoverInterruptedSessions: true
         recoverMaxAgeMs: 7200000
         recoverMaxSessions: 50
+        # Wait for the Host's tool providers to settle before resuming, so a
+        # resumed session is handed the same tools a fresh one would get.
+        resumeSettleMs: 3000
