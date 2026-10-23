@@ -155,6 +155,42 @@ test('criterion: an open turn boundary does NOT make a finished session recovera
   assert.equal(calls.resumed.length, 0)
 })
 
+test('criterion: a turn that finished but still has a queued prompt is recovered', async () => {
+  // The turn ended on its own, but the inbox still holds a prompt that never
+  // started — that is work in flight, and it must not be lost.
+  const { ctx, calls } = scanCtx([observation('s1', { kind: 'completed' }, {
+    inbox: { 'next-turn': [{ id: 'm1' }], 'next-step': [] },
+  })])
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, ['s1'])
+  assert.equal(calls.resumed.length, 1)
+})
+
+test('criterion: a queued step counts as work in flight too', async () => {
+  const { ctx, calls } = scanCtx([observation('s1', { kind: 'completed' }, {
+    inbox: { 'next-turn': [], 'next-step': [{ id: 'm1' }] },
+  })])
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, ['s1'])
+  assert.equal(calls.resumed.length, 1)
+})
+
+test('criterion: a finished turn with an empty inbox is not recovered', async () => {
+  const { ctx, calls } = scanCtx([observation('s1', { kind: 'completed' }, {
+    inbox: { 'next-turn': [], 'next-step': [] },
+  })])
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, [])
+  assert.equal(calls.resumed.length, 0)
+})
+
+test('criterion: a finished turn with no inbox projection is not recovered', async () => {
+  const { ctx, calls } = scanCtx([observation('s1', { kind: 'completed' })])
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, [])
+  assert.equal(calls.resumed.length, 0)
+})
+
 test('criterion: an interrupted turn is recovered even without any projection', async () => {
   const { ctx, calls } = scanCtx([observation('s1', { kind: 'interrupted' })])
   const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])

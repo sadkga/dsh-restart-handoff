@@ -62,6 +62,8 @@ const VECTORS = [
   ['bypass: nice -n 10', 'nice -n 10 kill -1', 'BLOCKED'],
   ['bypass: command builtin', 'command kill -1', 'BLOCKED'],
   ['bypass: xargs -0', 'echo 1 | xargs -0 kill -9', 'BLOCKED'],
+  ['bypass: busybox sh -c', "busybox sh -c 'kill -1'", 'BLOCKED'],
+  ['bypass: env -c', "env -c 'kill -1'", 'BLOCKED'],
 
   // --- read-only work that must not be blocked ---
   ['ro: systemctl status', 'systemctl --user status dsh.service', 'ALLOWED'],

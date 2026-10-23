@@ -398,6 +398,14 @@ test('vector: service dsh stop is denied', () => {
   assertDenied('service dsh stop')
 })
 
+test('vector: busybox sh -c "kill -1" is denied', () => {
+  assertDenied("busybox sh -c 'kill -1'")
+})
+
+test('vector: env -c "kill -1" is denied', () => {
+  assertDenied("env -c 'kill -1'")
+})
+
 // ---------------------------------------------------------------------------
 // F. The code channel: a call that RUNS its argument runs the command too.
 // ---------------------------------------------------------------------------

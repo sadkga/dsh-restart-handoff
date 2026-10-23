@@ -30,7 +30,8 @@ The model restarts the Host through **one dedicated tool**, `restart_dsh`, in
 A **planned** restart is the case above. An **unplanned** one — a crash, a
 kill, a power cut — leaves no handoff record, so on the next start the plugin
 scans the persisted sessions and brings back the ones whose last turn was
-interrupted.
+interrupted, plus the ones whose inbox still holds a prompt that never
+started.
 
 ## Why the model never runs the restart itself
 
@@ -74,6 +75,39 @@ The row in `cordis.patch.yml` overrides any of them:
         idleTimeoutMs: 30000
 ```
 
+## Installation
+
+The plugin is a plain host bundle: a `name`, an `inject` list and an `apply`.
+Install it with the Harness plugin manager, pointing the target at this
+directory:
+
+```
+plugin_manager → install_bundle → target: /home/sadkga/AI/Deepseek Harness/dsh-restart-handoff-v2
+```
+
+That writes the profile's `package.json` dependency (`link:` to this
+directory), adds `dsh-restart-handoff` to `dsh.profile.bundles`, and the
+loader applies `cordis.patch.yml`, which inserts the plugin row and its
+configuration.
+
+To wire it into a profile by hand instead:
+
+```jsonc
+// profiles/web/package.json
+"dependencies": {
+  "dsh-restart-handoff": "link:/home/sadkga/AI/Deepseek Harness/dsh-restart-handoff-v2"
+},
+"dsh": { "profile": { "bundles": ["dsh-restart-handoff"] } }
+```
+
+Then `pnpm install` in the profile directory (`nodeLinker: hoisted`) and a
+restart of the Host. The plugin needs Node 24 (`engines.node`).
+
+The Host must be supervised by a unit that restarts it — the plugin signals
+*itself* with `SIGTERM` and relies on `Restart=always` to bring the fresh
+process up. The unit in use here is `dsh.service` (`Restart=always`,
+`RestartSec=5`, `TimeoutStopUSec=1m30s`).
+
 ## Why it is built this way
 
 ### One tool, two steps, and the plan is bound to the warning
@@ -111,10 +145,10 @@ deleted once it has been replayed. A record that belongs to the running
 process is never replayed by that same process — that would be a restart that
 did not happen.
 
-### The recovery criterion is the LAST turn/end, and nothing else
+### The recovery criterion is the LAST turn/end — plus the queued work
 
 A session that was interrupted is recognised by **the reason its last turn
-ended**:
+ended**, and by **whether work is still waiting for it**:
 
 | last `turn/end` reason | recovered? | why |
 | --- | --- | --- |
@@ -123,6 +157,12 @@ ended**:
 | `aborted` + `user` | no | the human stopped it on purpose |
 | `completed` | no | it finished; nothing was in flight |
 | `error` | no | it failed; nothing was in flight |
+
+and, independently of the reason, a session whose **inbox still holds a prompt
+that never started** is recovered too: the turn it belonged to may have
+finished, but the accepted work is still waiting and would be lost with the
+process. The inbox projection is read as
+`projections.values.inbox['next-turn']` / `['next-step']`.
 
 The `interrupted` marker is the closer that `session-query` appends when it
 balances a log whose tail turn never ended — both on a cold read and on a
@@ -134,6 +174,9 @@ the rule. A cold read balances the log before the caller sees it, so that
 field is always `null`; a criterion built on it would look reasonable and
 never fire — dead code that makes the whole feature look alive while it does
 nothing. That is exactly the bug this rule replaces.
+
+The age bound uses the **last event's timestamp**, not the session's creation
+time: the synthetic closer reuses a real event's time, so the two agree.
 
 ### The guard judges commands, not mentions
 
@@ -151,12 +194,16 @@ Two scopes, one kernel:
   dsh.service` is documentation, and denying it would stop the agent from
   writing its own tests and notes.
 
+In short: **the guard covers the execution channels; a pure data payload is
+not judged as a command.**
+
 The code-shaped self-harm signals — `os.kill(os.getppid(), …)`,
 `process.kill(process.ppid, …)`, `os.killpg`, `process.kill(-1, …)` — are
 denied in **every** tool, because a sentence never contains them.
 
-The kernel also recurses into the payload of an interpreter (`sh -c '…'`) and
-of an executor call (`execSync('pkill -f node')`,
+The kernel also recurses into the payload of an interpreter (`sh -c '…'`), of
+anything that hands a `-c` payload to a program (`busybox sh -c '…'`) and of
+an executor call (`execSync('pkill -f node')`,
 `subprocess.run(['kill', '-1'])`, `tools.bash({ command: 'pkill -f node' })`),
 because their argument runs exactly what a shell segment would.
 
@@ -178,7 +225,9 @@ not a conversation choice and is therefore not inherited.
   in principle be obfuscated (`base64 -d | sh`, variable concatenation). Its
   value is that it steers the model to `restart_dsh` and explains the
   consequence; real isolation needs a PATH allowlist or a separate cgroup,
-  which is a Host change.
+  which is a Host change. **The real backstop is that the work comes back
+  even when the Host is killed** — the unplanned-recovery path does not care
+  how the process died.
 * **A tool whose name does not say it executes anything is treated as a data
   tool.** Its payload is not judged as a command, so a third-party plugin tool
   that executes an arbitrary string it received in a payload is outside the
@@ -187,18 +236,17 @@ not a conversation choice and is therefore not inherited.
 * **Only `continuable` subagents are woken.** A `one-shot` child cannot be
   continued.
 * **A session the human stopped does not come back.** `aborted` + `user` is
-  explicitly excluded, and so are `completed` and `error`.
-* **A prompt that was queued when the process died is not replayed** unless
-  the turn it belonged to was itself interrupted. The last `turn/end` reason
-  is the only signal; a queued prompt on top of a *completed* turn stays
-  queued.
+  explicitly excluded, and so are `completed` and `error` — unless the inbox
+  still holds a prompt that never started.
 * **Recovery is bounded.** One start recovers at most `recoverMaxSessions`
   sessions, and only those newer than `recoverMaxAgeMs`, newest first.
 * **The browser side is not the plugin's job.** The Host restarts, the page
   briefly disconnects, and the frontend re-attaches. The plugin restores the
   *sessions and the work*, not the page's connection.
 * **`serviceUnit` is descriptive only.** The restart is a self-signal, so the
-  unit is never invoked by this plugin.
+  unit is never invoked by this plugin; the name is only written to the log
+  line that announces the exit. The unit's own `Restart=always` is what
+  actually brings the fresh process up.
 
 ## Tests
 
@@ -210,7 +258,7 @@ npm test        # node --test
 | --- | --- |
 | `test/restart-handoff.test.mjs` | The two-step confirmation, the token TTL, the confirmation's edges, the session collection, the model route, the records on disk. |
 | `test/guard-vectors.test.mjs` | The guard's vector suite: one command, one assertion. |
-| `test/recovery-criterion.test.mjs` | The recovery matrix: which `turn/end` reason means "come back". |
+| `test/recovery-criterion.test.mjs` | The recovery matrix: which `turn/end` reason means "come back", and the queued-prompt case. |
 | `test/handoff-replay.test.mjs` | The replay path: resume, handoff record, subagents, teammates. |
 | `test/plugin-lifecycle.test.mjs` | `apply` registers the tool, the guard and the prompt section, and survives a refused registration. |
 | `test/session-collection.test.mjs` | Which sessions a restart has to bring back. |

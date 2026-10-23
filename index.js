@@ -60,7 +60,7 @@ export const name = 'restart-handoff'
  * resolved at call time: a profile without delegation still restarts and
  * resumes its sessions.
  */
-export const inject = ['tools', 'agents', 'sessions', 'sessionPersistence', 'sessionQuery', 'systemPrompt', 'agentDefaultModel']
+export const inject = ['tools', 'agents', 'sessionPersistence', 'sessionQuery', 'systemPrompt', 'agentDefaultModel']
 
 /** Default settings; the profile's patch row overrides any of them. */
 const DEFAULTS = {
@@ -184,6 +184,14 @@ const SELF_HARM_PATTERNS = TEXT_RESTART_PATTERNS.slice(0, 4)
 const EXECUTION_CALLS = /(?:\w+\.)*(?:exec|execsync|execfile|execfilesync|spawn|spawnsync|fork|system|popen|check_output|check_call|getoutput|run|call|eval|bash|zsh|pwsh|powershell)(?:\s*\.\s*\w+)*\s*\(/i
 
 /**
+ * A segment that hands a `-c` payload to something: that payload is code, so
+ * it is parsed recursively. This covers the wrappers around an interpreter
+ * (`busybox sh -c '…'`, `env -c '…'`), where the head verb is not the
+ * interpreter itself.
+ */
+const CODE_PAYLOAD_OPTION = /(?:^|\s)-c(?:\s|$)/
+
+/**
  * The quoted strings inside a segment.
  * @param {string} segment - one segment of a command line.
  * @returns {string[]} the quoted payloads.
@@ -243,14 +251,22 @@ function dangerousSegments(command, depth = 0) {
     const { word, viaXargs } = headVerb(segment)
     if (viaXargs && /\b(kill|pkill|killall5?)\b/.test(segment)) { found.push(segment); continue }
     if (ALWAYS_DANGEROUS.has(word)) { found.push(segment); continue }
-    if (depth < 2 && (INTERPRETERS.has(word) || EXECUTION_CALLS.test(segment))) {
+    if (depth < 2) {
       const payloads = quotedPayloads(segment)
-      for (const payload of payloads) found.push(...dangerousSegments(payload, depth + 1))
-      // The payload of an array-style call is split across its items
-      // (`subprocess.run(['kill', '-1'])`), so the items are judged together
-      // as well as one by one.
-      if (payloads.length > 1) found.push(...dangerousSegments(payloads.join(' '), depth + 1))
-      continue
+      const isCodeCarrier = INTERPRETERS.has(word)
+        || EXECUTION_CALLS.test(segment)
+        || (CODE_PAYLOAD_OPTION.test(segment) && payloads.length > 0)
+      if (isCodeCarrier) {
+        for (const payload of payloads) found.push(...dangerousSegments(payload, depth + 1))
+        // The payload of an array-style call is split across its items
+        // (`subprocess.run(['kill', '-1'])`), so the items are judged together
+        // as well as one by one.
+        if (payloads.length > 1) found.push(...dangerousSegments(payloads.join(' '), depth + 1))
+        // An interpreter or an executor with no quoted payload ends the
+        // segment: its head verb is the whole story. A `-c` carrier falls
+        // through instead, so its head verb is judged as well.
+        if (INTERPRETERS.has(word) || EXECUTION_CALLS.test(segment)) continue
+      }
     }
     if (!DANGEROUS_VERBS.has(word)) continue
     if (word === 'fuser') {
@@ -518,6 +534,9 @@ async function resumeSession(ctx, sessionId) {
       }
       await new Promise(resolve => { setTimeout(resolve, 500) })
     } finally {
+      // The observation is a lease and is released when it goes out of scope.
+      // Baseline implementation, carried over unchanged: the exact disposal
+      // contract was not re-verified line by line against the Host source.
       observation?.[Symbol.dispose]?.()
     }
   }
@@ -717,9 +736,11 @@ async function wakeTeamMembers(ctx, lead, record) {
  * boundary: the durable fingerprint is the last turn's ENDING - `interrupted`
  * (the writer crashed) or `aborted` with a `disposed` cause (the process was
  * torn down mid-turn). A turn the human stopped, or one that finished on its
- * own, had nothing in flight.
+ * own, had nothing in flight — UNLESS its inbox still holds a prompt that
+ * never started, which is work in flight as well.
  * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
  * @param {Record<string, any>} settings - effective plugin settings.
+ * @param {string[]} [alreadyResumed] - the sessions the handoff already resumed.
  * @returns {Promise<string[]>} the ids of the recovered sessions.
  */
 async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
@@ -761,9 +782,15 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     // failed (`error`) had nothing in flight and must stay dead.
     const wasCutOff = endReason?.kind === 'interrupted'
       || (endReason?.kind === 'aborted' && endReason.reason?.kind === 'disposed')
+    // A queued prompt that never started is work in flight too: the turn it
+    // belonged to may have finished, but the accepted work is still waiting
+    // and would be lost with the process.
+    const inboxState = observation?.projections?.values?.inbox
+    const queued = (inboxState?.['next-turn']?.length ?? 0) > 0
+      || (inboxState?.['next-step']?.length ?? 0) > 0
     const lastEvent = observation?.events?.[observation.events.length - 1]
     if (typeof lastEvent?.time === 'number' && Date.now() - lastEvent.time > maxAgeMs) continue
-    if (!wasCutOff) continue
+    if (!wasCutOff && !queued) continue
     if (recovered.length >= maxSessions) break
     const agent = await resumeSession(ctx, id)
     if (agent === undefined) continue
@@ -992,7 +1019,9 @@ async function completeRestart(ctx, settings, callerId, onExit) {
         sessions: ids.map(id => ({ id, kind: id === callerId ? 'initiator' : 'peer' })),
       })
     }
-    const persistence = ctx.get?.('sessionPersistence') ?? ctx.sessionPersistence
+    // Services are reached through `ctx.get('name')` ONLY: a direct property
+    // access throws when the service is absent, and `?.` does not protect it.
+    const persistence = ctx.get('sessionPersistence')
     await persistence?.flush?.()
   } catch (error) {
     console.error('[restart-handoff] could not prepare the restart:', error)
@@ -1018,6 +1047,16 @@ async function completeRestart(ctx, settings, callerId, onExit) {
 export function apply(ctx, config = {}) {
   const settings = { ...DEFAULTS, ...config }
   const log = (...args) => { ctx.logger?.info?.('[restart-handoff]', ...args) }
+
+  // A confirmation never survives the restart it was meant to authorise: the
+  // fresh process has no pending warning for the model to confirm against.
+  // The cleanup is UNCONDITIONAL — it happens even when the replay is off,
+  // otherwise a token could outlive the restart it was issued for.
+  ctx.effect(() => {
+    void clearRecord(settings, PENDING_FILE).catch((error) => {
+      console.error('[restart-handoff] could not clear the pending confirmation:', error)
+    })
+  })
 
   // The handoff replay comes first and must never take the process down: a
   // broken registration must not cost the user the sessions they were waiting

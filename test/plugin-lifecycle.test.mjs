@@ -10,11 +10,13 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply, inject, internals, name } from '../index.js'
+
+const { PENDING_FILE, readRecord } = internals
 
 /**
  * A host double that records what the plugin registers.
@@ -147,4 +149,15 @@ test('the internals export the whole contract', () => {
   ]) {
     assert.equal(typeof internals[key], 'function', `internals.${key} must be a function`)
   }
+})
+
+test('a pending confirmation is cleared at startup, even with the replay off', async () => {
+  const dir = await tempDir()
+  await writeFile(join(dir, PENDING_FILE), JSON.stringify({ createdAt: Date.now(), token: 'x' }), 'utf8')
+  const { ctx } = hostDouble()
+  apply(ctx, { handoffDir: dir, autoResume: false })
+  // The cleanup is an effect; give it a tick to land on disk.
+  await new Promise(resolve => { setTimeout(resolve, 20) })
+  assert.equal(await readRecord({ handoffDir: dir }, PENDING_FILE), undefined)
+  await rm(dir, { recursive: true, force: true })
 })
