@@ -982,7 +982,26 @@ function createRestartTool(ctx, settings) {
         required: ['scheduled', 'message'],
         additionalProperties: false,
       },
-      render: (_args, value) => [{ type: 'text', text: value?.message ?? JSON.stringify(value) }],
+      // The token must reach the caller: it is the ONLY way to make the
+      // second, confirming call, and `message` alone never carries it. The
+      // plan (reason and the sessions that will be resumed) is shown next to
+      // it, so the model confirms something it actually saw.
+      render: (_args, value) => {
+        if (value === null || typeof value !== 'object') {
+          return [{ type: 'text', text: JSON.stringify(value) }]
+        }
+        const lines = [value.message ?? JSON.stringify(value)]
+        if (typeof value.confirmToken === 'string' && value.confirmToken !== '') {
+          lines.push(`confirmToken: ${value.confirmToken}`)
+        }
+        if (value.reason !== undefined && value.reason !== '') {
+          lines.push(`reason: ${value.reason}`)
+        }
+        if (Array.isArray(value.sessions)) {
+          lines.push(`sessions that will be resumed (${value.sessions.length}): ${value.sessions.length > 0 ? value.sessions.join(', ') : 'none'}`)
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
     },
     async execute(args, exec) {
       const callerId = exec?.agent?.id
