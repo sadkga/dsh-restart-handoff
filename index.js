@@ -975,7 +975,8 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       // The session is up already, but a child of it may have been cut off by
       // the same exit. Walk the children rather than skipping the whole tree.
       const wokenChildren = await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
-      console.error(`[restart-handoff] scan: ${id} skipped (already live) woken=${wokenChildren.length}`)
+      const wokenTeammates = await wakeTeamMembers(ctx, ctx.get('agents')?.get?.(id), { reason: 'unexpected restart' })
+      console.error(`[restart-handoff] scan: ${id} skipped (already live) woken=${wokenChildren.length} teammates=${wokenTeammates.length}`)
       continue
     }
     if (alreadyResumed.includes(id)) {
@@ -1037,8 +1038,13 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     }
     agent.followup(userMessage('The Harness process went down unexpectedly and your session was resumed. Continue the work that was in flight.'))
     const woken = await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
+    // A teammate is not a subagent: the Team roster owns it, and it is woken
+    // through the Team path. The handoff replay has always done this; the
+    // unplanned-exit scan used to forget it, which left every teammate of the
+    // session the user had open asleep after a crash.
+    const wokenTeammates = await wakeTeamMembers(ctx, agent, { reason: 'unexpected restart' })
     recovered.push(id)
-    console.error(`[restart-handoff] scan: ${id} restored (${cutOff.cutOff ? cutOff.reason : 'queued-work'}) woken=${woken.length}`)
+    console.error(`[restart-handoff] scan: ${id} restored (${cutOff.cutOff ? cutOff.reason : 'queued-work'}) woken=${woken.length} teammates=${wokenTeammates.length}`)
   }
   console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length} skipped-live=${skipped.live} skipped-child=${skipped.child} skipped-replayed=${skipped.replayed} skipped-noId=${skipped.noId}`)
   return recovered
