@@ -77,12 +77,39 @@ The row in `cordis.patch.yml` overrides any of them:
 
 ## Installation
 
+Install it into a profile with the Harness plugin CLI. **`--profile` is
+required** — the CLI forwards the rest to `pnpm` inside that profile's
+directory:
+
+```bash
+dsh plugin --profile web add dsh-restart-handoff
+```
+
+From GitHub instead of npm (no registry account needed):
+
+```bash
+dsh plugin --profile web add github:sadkga/dsh-restart-handoff
+```
+
+Pin a version by tag:
+
+```bash
+dsh plugin --profile web add github:sadkga/dsh-restart-handoff#v0.2.0
+```
+
+Restart the Host afterwards: the plugin's client metadata and the loader are
+cached until the process restarts.
+
+The plugin needs Node 24 (`engines.node`).
+
+### Installing from a checkout
+
 The plugin is a plain host bundle: a `name`, an `inject` list and an `apply`.
-Install it with the Harness plugin manager, pointing the target at this
+To install a local working copy with the plugin manager, point it at the
 directory:
 
 ```
-plugin_manager → install_bundle → target: /home/sadkga/AI/Deepseek Harness/dsh-restart-handoff-v2
+plugin_manager → install_bundle → target: /path/to/dsh-restart-handoff
 ```
 
 That writes the profile's `package.json` dependency (`link:` to this
@@ -95,13 +122,13 @@ To wire it into a profile by hand instead:
 ```jsonc
 // profiles/web/package.json
 "dependencies": {
-  "dsh-restart-handoff": "link:/home/sadkga/AI/Deepseek Harness/dsh-restart-handoff-v2"
+  "dsh-restart-handoff": "link:/path/to/dsh-restart-handoff"
 },
 "dsh": { "profile": { "bundles": ["dsh-restart-handoff"] } }
 ```
 
 Then `pnpm install` in the profile directory (`nodeLinker: hoisted`) and a
-restart of the Host. The plugin needs Node 24 (`engines.node`).
+restart of the Host.
 
 The Host must be supervised by a unit that restarts it — the plugin signals
 *itself* with `SIGTERM` and relies on `Restart=always` to bring the fresh
@@ -219,6 +246,51 @@ preset, all read from the session log rather than from the deployment
 defaults — including the rule that an adapter-defaulted reasoning effort is
 not a conversation choice and is therefore not inherited.
 
+## Recovery performance
+
+The scan runs on every start, so its cost is felt by everyone who restarts the
+Host. Three things were measured on a real store (132 candidate sessions,
+including one 8 MB / 20 000-event log):
+
+| | `took` (whole scan) | `reads` | `readMs` |
+| --- | --- | --- | --- |
+| naive: read every log in full | 97 750 ms | 49 | 87 353 ms |
+| + mtime pre-filter | 31 901 ms | 14 | 29 631 ms |
+| + read the log **tail** | — | — | **14 ms** |
+| + deliver without waiting for a busy agent | **12 873 ms** | **2** | **14 ms** |
+
+Three decisions produce that:
+
+* **The age window is decided from the file's mtime, before the log is
+  read.** Reading a log means decompressing and parsing every event in it; most
+  candidates on a real store are long dead. The pre-filter is strictly more
+  conservative than the durable rule it pre-decides — the whole store was
+  measured, and the difference between a log's last event time and its mtime
+  never exceeded 5.7 ms.
+* **Only the tail of the log is read.** The criterion is "was the *last* turn
+  cut off", so the answer lives at the end: the last `turn/start` and whether a
+  `turn/end` follows it. The log is a multi-frame zstd file, so the frames are
+  walked from the end and only the last few are decompressed — 88 events
+  instead of 21 486 for the largest session. The tail criterion and the
+  full-log criterion were compared over every session on the store and agree
+  on all of them.
+* **A busy agent is not waited for.** A `followup` queues a message for the
+  agent's *next* turn; a running agent consumes it at its own turn boundary. A
+  message sitting in the queue of a running agent is the normal state, not a
+  failure, so the delivery does not wait for the agent to go idle.
+
+The remaining ~12 s is the cost of actually starting the recovered sessions and
+their subagents, not of inspecting them.
+
+Two known costs sit outside this plugin's reach:
+
+* Ten of the store's logs are **single-frame** zstd files; a single frame must
+  be decompressed from its start, so those fall back to a full read. Making
+  them cheap needs the Host to cut logs into more frames.
+* The `readSession` path spends most of its time in CPU (decompress, parse,
+  `structuredClone`, replay validation), not I/O — which is why reading the
+  tail is such a large win, and why reading the logs in parallel is not.
+
 ## Known boundaries
 
 * **The guard is guidance, not isolation.** It matches command text, so it can
@@ -233,13 +305,18 @@ not a conversation choice and is therefore not inherited.
   that executes an arbitrary string it received in a payload is outside the
   guard's reach. The shell, terminal and code-runner channels — the ones a
   model actually uses to restart the Host — are covered.
-* **Only `continuable` subagents are woken.** A `one-shot` child cannot be
-  continued.
+* **A subagent is woken because its log was cut off, not because of its mode.**
+  A `continuable` child and a `one-shot` child are treated the same: if the
+  child's own log shows an unclosed turn, it is woken and told to pick the work
+  back up. A child that finished has nothing to pick up and is left asleep.
 * **A session the human stopped does not come back.** `aborted` + `user` is
   explicitly excluded, and so are `completed` and `error` — unless the inbox
   still holds a prompt that never started.
 * **Recovery is bounded.** One start recovers at most `recoverMaxSessions`
-  sessions, and only those newer than `recoverMaxAgeMs`, newest first.
+  sessions, and only those newer than `recoverMaxAgeMs`, newest first. The age
+  window is decided from the log file's mtime before the log is read, which is
+  strictly more conservative than the rule it pre-decides: a session
+  interrupted a moment ago can never be filtered out by it.
 * **The browser side is not the plugin's job.** The Host restarts, the page
   briefly disconnects, and the frontend re-attaches. The plugin restores the
   *sessions and the work*, not the page's connection.
