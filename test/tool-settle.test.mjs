@@ -15,11 +15,12 @@ function announceCtx(plan = {}) {
   let changes = 0
   const ctx = {
     on(event, handler) {
-      if (event !== 'system-prompt/change') return
+      if (event !== 'system-prompt/change' && event !== 'tools/change') return
       listeners.add(handler)
+      return () => listeners.delete(handler)
     },
     off(event, handler) {
-      if (event !== 'system-prompt/change') return
+      if (event !== 'system-prompt/change' && event !== 'tools/change') return
       listeners.delete(handler)
     },
   }
@@ -34,6 +35,36 @@ function announceCtx(plan = {}) {
   timer.unref?.()
   return { ctx, changes: () => changes, stop: () => clearInterval(timer) }
 }
+
+test('a tool registered late is waited for too', async () => {
+  // The missing tools arrived through the tool REGISTRY, not the prompt
+  // layers: waiting on `system-prompt/change` alone let the wait end while a
+  // client's `registerTool` was still pending, and the resumed session came
+  // up 18 tools short.
+  const listeners = new Map()
+  let fired = 0
+  const ctx = {
+    on(event, handler) {
+      listeners.set(event, handler)
+      return () => listeners.delete(event)
+    },
+  }
+  // The late registrations arrive and then stop — the shape of a Host coming
+  // up, not a registry that changes forever.
+  const timer = setInterval(() => {
+    fired += 1
+    if (fired > 3) return
+    const handler = listeners.get('tools/change')
+    if (handler !== undefined) handler()
+  }, 80)
+  timer.unref?.()
+
+  const observed = await waitForToolProviders(ctx, 3000)
+  clearInterval(timer)
+
+  assert.equal(observed.settled, true)
+  assert.ok(observed.changes >= 3, `the tool-registry announcements must be seen, saw ${observed.changes}`)
+})
 
 test('the recovery waits for the prompt registry to go quiet', async () => {
   // A session is handed the tool set that exists when it is resumed. Plugins

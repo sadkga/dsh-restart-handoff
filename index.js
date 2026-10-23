@@ -590,15 +590,14 @@ function isRootSession(ctx, sessionId) {
  * carried 123, the difference being a client plugin and an MCP server that
  * were still coming up.
  *
- * The Host announces every change to its prompt registry with
- * `system-prompt/change` — a documented public event, emitted when a section,
- * context, tool provider or variable is registered or disposed. The wait
- * listens for it and resumes only after the registry has been quiet for a
- * moment. Waiting for the set to be *complete* would need the Host to
- * publish what "complete" means; waiting for it to be *stable* needs only
- * the Host's own announcement, and stability is the property that matters —
- * a session resumed against a settled registry gets the tools a fresh one
- * would get.
+ * The Host announces every change to its tool registry with `tools/change`
+ * and every change to its prompt layers with `system-prompt/change` — both
+ * documented public events. The wait listens for them and resumes only after
+ * the registry has been quiet for a moment. Waiting for the set to be
+ * *complete* would need the Host to publish what "complete" means; waiting
+ * for it to be *stable* needs only the Host's own announcement, and stability
+ * is the property that matters — a session resumed against a settled
+ * registry gets the tools a fresh one would get.
  * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
  * @param {number} budgetMs - how long to wait at most.
  * @returns {Promise<{ settled: boolean, changes: number, waitedMs: number }>} what was observed.
@@ -612,8 +611,16 @@ async function waitForToolProviders(ctx, budgetMs) {
     changes += 1
     lastChangeAt = Date.now()
   }
-  // The event is documented as part of the service's surface; a Host that
-  // does not publish it simply leaves the wait to its budget.
+  // The events are documented as part of the Host's surface; a Host that does
+  // not publish them simply leaves the wait to its budget.
+  //
+  // `tools/change` is the one that matters here: it is emitted whenever the
+  // tool REGISTRY changes — a plugin calling `registerTool` announces itself
+  // through it. `system-prompt/change` covers the prompt layers, which is a
+  // different registry; a client plugin's tools reach a session through the
+  // former, so waiting on the latter alone let the wait end while those tools
+  // were still missing — measured: the registry went quiet for 1240ms and the
+  // resumed session still came up 18 tools short.
   //
   // The subscription is NOT undone with `ctx.off`: that call needs an inject
   // context and throws "cannot get property off without inject" — which is
@@ -621,12 +628,15 @@ async function waitForToolProviders(ctx, budgetMs) {
   // disposer, and the plugin's own fiber unsubscribes everything when the
   // bundle is unloaded, so leaving the listener in place is both safe and
   // correct.
-  let dispose = null
-  if (typeof ctx.on === 'function') {
+  const disposers = []
+  for (const event of ['tools/change', 'system-prompt/change']) {
+    if (typeof ctx.on !== 'function') continue
     try {
-      dispose = ctx.on('system-prompt/change', onChange)
+      const dispose = ctx.on(event, onChange)
+      if (typeof dispose === 'function') disposers.push(dispose)
     } catch {
-      dispose = null
+      // A Host that refuses the subscription is watched less closely, not
+      // watched wrongly.
     }
   }
   try {
@@ -637,7 +647,7 @@ async function waitForToolProviders(ctx, budgetMs) {
       }
     }
   } finally {
-    if (typeof dispose === 'function') {
+    for (const dispose of disposers) {
       try { dispose() } catch { /* the fiber will drop it anyway */ }
     }
   }
