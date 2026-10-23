@@ -652,8 +652,14 @@ async function runHandoff(ctx, settings) {
     }
     for (const childId of woken) wokenChildren.push(childId)
 
+    // The initiator asked for the restart, so it gets the request back. A peer
+    // is only carried along: it was running when the restart happened and its
+    // own work is what it must pick up. The message therefore speaks about
+    // THAT session — telling it that "the other running sessions were resumed
+    // too" put a fact about other conversations into its own transcript, where
+    // it is noise and reads like a broadcast rather than an instruction.
     const text = entry.kind === 'peer'
-      ? `${intro} Your session was resumed and the other running sessions were resumed too. Continue the work you had in flight.`
+      ? `${intro} Your session was resumed — continue the work that was in flight.`
       : `${intro} Continue the work below.\n\n${record.continuePrompt}`
     // A freshly resumed agent may already be carrying work (the resume itself
     // can open a turn), so the same claim check applies here: a delivery that

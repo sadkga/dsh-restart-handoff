@@ -180,7 +180,12 @@ test('every session in the handoff is resumed and woken', async () => {
   assert.deepEqual(calls.resumed.map(call => call.resumeSessionId), ['s-init', 's-peer'])
   assert.equal(calls.followups.length, 2)
   assert.match(calls.followups[0].content[0].text, /do the thing/)
-  assert.match(calls.followups[1].content[0].text, /Continue the work you had in flight/)
+  const peerText = calls.followups[1].content[0].text
+  assert.match(peerText, /continue the work that was in flight/)
+  // The peer is told about ITSELF. A fact about the other conversations
+  // belongs in the initiator's message, not in this session's transcript,
+  // where it reads like a broadcast instead of an instruction.
+  assert.doesNotMatch(peerText, /other running sessions/)
   assert.equal(await readRecord(settings, HANDOFF_FILE), undefined)
   await rm(dir, { recursive: true, force: true })
 })
