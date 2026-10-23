@@ -1,5 +1,5 @@
 import { join as pathJoin } from 'node:path'
-import { readFile as fsReadFile, writeFile as fsWriteFile, mkdir as fsMkdir, rename as fsRename, rm as fsRm } from 'node:fs/promises'
+import { readFile as fsReadFile, writeFile as fsWriteFile, mkdir as fsMkdir, rename as fsRename, rm as fsRm, stat as fsStat } from 'node:fs/promises'
 /**
  * Host half of the restart-handoff bundle.
  *
@@ -926,6 +926,122 @@ async function wasSessionCutOff(ctx, sessionId) {
 }
 
 /**
+ * Safety margin added to the harvest window before a `stat` may skip a session.
+ *
+ * The pre-filter compares a log file's mtime against the last event's `time`,
+ * which are stamped by the same write. Measured over all 137 sessions of the
+ * live store, `lastEventTime - mtime` never exceeded 5.7ms. A minute of slack
+ * costs nothing in reads (a session inside the window is read anyway) and
+ * makes the filter strictly more conservative than the rule it pre-decides.
+ */
+const STALE_PRE_FILTER_SLACK_MS = 60 * 1000
+
+/**
+ * Filesystem-safe form of one path segment, mirroring the persistence layer.
+ *
+ * The jsonl backend stores a session under `sessions/--<projectKey>--/<segment>`
+ * and encodes both the project directory and the session id with the same rule:
+ * `[A-Za-z0-9._-]` passes through, every other UTF-16 code unit becomes
+ * `~XXXX`. Reproduced here because the scan needs the session's log FILE, and
+ * the persistence layer exposes no path — only a header and an id.
+ * @param {string} raw - the id or path segment.
+ * @returns {string} the encoded segment.
+ */
+function encodeSegment(raw) {
+  if (raw === '.') return '~002E'
+  if (raw === '..') return '~002E~002E'
+  let out = ''
+  for (let i = 0; i < raw.length; i += 1) {
+    const code = raw.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) out += ch
+    else out += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+  }
+  return out
+}
+
+/**
+ * The project directory name for a session's working directory.
+ *
+ * Separators and the Windows drive colon collapse to one `-`; other unsafe
+ * code units use the same escape as {@link encodeSegment}. The name is bounded
+ * to the filesystem component limit.
+ * @param {string} cwd - the session's project directory.
+ * @returns {string} the project directory name.
+ */
+function projectKey(cwd) {
+  let readable = ''
+  let separatorRun = false
+  for (let i = 0; i < cwd.length; i += 1) {
+    const code = cwd.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch === '/' || ch === '\\' || ch === ':') {
+      if (!separatorRun) readable += '-'
+      separatorRun = true
+    } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+      separatorRun = false
+    }
+  }
+  // A separator RUN collapses to one dash, and a run at either end collapses
+  // into the surrounding `--` wrapper instead of leaving a stray dash:
+  // "/home/user/" must be `--home-user--`, not `--home-user---`.
+  const slug = readable.replace(/^-+|-+$/g, '') || 'root'
+  return `--${slug.slice(0, 251)}--`
+}
+
+/**
+ * The mtime of a session's durable log, or `undefined` when it cannot be read.
+ *
+ * Reading a timestamp costs one `stat`; reading the log costs a full
+ * decompress-and-parse of every event. On the live store 87 of the scan's 91
+ * seconds went to 49 such reads, and most of those sessions were then thrown
+ * away as older than the window. So the window is decided from the filesystem
+ * before any log is read.
+ *
+ * WHY MTIME IS THE RIGHT PROXY. The scan's stale rule looks at the `time` of
+ * the LAST event in the log. A log is appended as events happen, so the file's
+ * mtime is stamped by the same write as its last event: measured over all 137
+ * sessions of the live store, `lastEventTime - mtime` never exceeded 5.7ms.
+ * mtime can therefore never be much OLDER than the last event, which makes the
+ * filter CONSERVATIVE — a session interrupted a moment ago has a recent mtime
+ * and can never be skipped. {@link STALE_PRE_FILTER_SLACK_MS} keeps the filter
+ * on the safe side of that measurement.
+ *
+ * `header.createdAt` is NOT usable here and is deliberately not used: it is the
+ * session's CREATION time and a fork inherits its parent's. At the default
+ * two-hour window, 25 sessions of that store had a last event inside the window
+ * while their `createdAt` said otherwise — including `session-e8d56666`, which
+ * a createdAt filter would have dropped and the durable criterion keeps.
+ * @param {string} sessionId - the session id.
+ * @param {string | undefined} cwd - the session's recorded working directory.
+ * @param {number} now - the scan's reference instant.
+ * @param {number} maxAgeMs - the harvest window.
+ * @returns {Promise<{ stale: boolean, mtime?: number }>} whether the log is
+ *   provably outside the window, and the mtime when it could be read.
+ */
+async function staleByLogMtime(sessionId, cwd, now, maxAgeMs) {
+  const home = process.env.DSH_HOME ?? process.cwd()
+  const root = pathJoin(home, 'sessions')
+  const dir = pathJoin(root, projectKey(cwd ?? ''), encodeSegment(sessionId))
+  for (const file of ['session.v4.jsonl.zstd', 'session.v4.jsonl']) {
+    let stats
+    try {
+      stats = await fsStat(pathJoin(dir, file))
+    } catch {
+      continue
+    }
+    return { stale: now - stats.mtimeMs > maxAgeMs + STALE_PRE_FILTER_SLACK_MS, mtime: stats.mtimeMs }
+  }
+  // No stat means no proof: an unreadable path must never be a reason to skip
+  // a session. Fall through to the log, which decides on the durable criterion.
+  return { stale: false, mtime: undefined }
+}
+
+/**
  * Recover the sessions a crashed process left behind.
  *
  * A planned restart leaves a handoff record. A crash, a kill, or any other
@@ -953,7 +1069,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     console.error('[restart-handoff] could not list the sessions:', error)
     return []
   }
-  const skipped = { noId: 0, child: 0, live: 0, replayed: 0 }
+  const skipped = { noId: 0, child: 0, live: 0, replayed: 0, stale: 0, prefiltered: 0 }
   const scanStartedAt = Date.now()
   let readMs = 0
   let readCount = 0
@@ -1001,9 +1117,13 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       const verdict = await wasSessionCutOff(ctx, id)
       if (verdict.cutOff && liveAgent !== undefined && typeof liveAgent.followup === 'function') {
         try {
-          liveAgent.followup(userMessage('The Harness process went down unexpectedly. Your session is open again — continue the work that was in flight.'))
+          const queued = userMessage('The Harness process went down unexpectedly. Your session is open again — continue the work that was in flight.')
+          liveAgent.followup(queued)
           nudged = true
-          console.error(`[restart-handoff] scan: ${id} already live, told to continue (${verdict.reason})`)
+          const inboxAfter = liveAgent?.inbox
+          const pendingNow = (inboxAfter?.nextTurn?.length ?? 0) + (inboxAfter?.nextStep?.length ?? 0)
+          if (pendingNow === 0) console.error(`[restart-handoff] WARNING: the nudge never landed in the inbox of ${id}`)
+          console.error(`[restart-handoff] scan: ${id} already live, told to continue (${verdict.reason}) status=${liveAgent?.status} nextTurn=${inboxAfter?.nextTurn?.length ?? '?'} running=${typeof liveAgent?.status === 'string' ? liveAgent.status : '?'}`)
         } catch (error) {
           console.error(`[restart-handoff] could not nudge the live session ${id}:`, error)
         }
@@ -1018,6 +1138,18 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     }
     if (archived?.has(id)) {
       console.error(`[restart-handoff] scan: ${id} skipped (archived)`)
+      continue
+    }
+    // The stale window is decided from the log file's mtime BEFORE the log is
+    // read: reading it costs a full decompress-and-parse of every event, and
+    // most candidates on a real store are long dead. The pre-filter is strictly
+    // more conservative than the durable rule it pre-decides — see
+    // `staleByLogMtime` — so a session it skips would have been skipped below
+    // anyway, and a session interrupted a moment ago can never be skipped here.
+    const prefilter = await staleByLogMtime(id, record?.header?.cwd, Date.now(), maxAgeMs)
+    if (prefilter.stale) {
+      skipped.prefiltered += 1
+      console.error(`[restart-handoff] scan: ${id} skipped (older than the window, by mtime)`)
       continue
     }
     // The log is read with `readSession`, not `observeSession`: the latter
@@ -1414,6 +1546,7 @@ export function apply(ctx, config = {}) {
  */
 export const internals = {
   DEFAULTS,
+  STALE_PRE_FILTER_SLACK_MS,
   HANDOFF_FILE,
   PENDING_FILE,
   archivedIds,
@@ -1424,6 +1557,7 @@ export const internals = {
   createRestartTool,
   cutOffReason,
   dangerousSegments,
+  encodeSegment,
   hasPendingWork,
   headVerb,
   isCommandTool,
@@ -1433,12 +1567,14 @@ export const internals = {
   lastRequestHeader,
   listResumableSessions,
   listSubagents,
+  projectKey,
   readRecord,
   recoverUnplannedSessions,
   resumeSession,
   routeFor,
   runHandoff,
   selfKillSegments,
+  staleByLogMtime,
   teamMemberIds,
   wakeSubagents,
   wakeTeamMembers,
