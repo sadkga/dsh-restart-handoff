@@ -309,3 +309,49 @@ test('wakeTeamMembers survives a missing lead handle', async () => {
   const { wakeTeamMembers } = internals
   assert.deepEqual(await wakeTeamMembers(ctx, undefined, { reason: 'because' }), [])
 })
+
+test('a handoff record naming no real session is dropped, not retried forever', async () => {
+  // Observed in production: a record carrying the literal id "caller" was
+  // re-attempted on every boot, throwing "session caller not found" and
+  // replaying nothing. An unhonourable record must not survive.
+  const { dir, settings } = await fixture()
+  await writeFile(join(dir, HANDOFF_FILE), JSON.stringify({
+    phase: 'prepared',
+    sessionId: 'caller',
+    sessions: [{ id: 'caller', kind: 'initiator' }],
+    reason: 'because',
+    continuePrompt: 'carry on',
+    resumeSubagents: true,
+    createdAt: Date.now(),
+    createdByPid: 1,
+  }), 'utf8')
+  const ctx = {
+    get(name) {
+      if (name !== 'sessionQuery') return undefined
+      return { observeSession: async () => { throw new Error('session "caller" not found') } }
+    },
+  }
+  const resumed = await runHandoff(ctx, settings)
+  assert.deepEqual(resumed, [])
+  assert.equal(await readRecord(settings, HANDOFF_FILE), undefined, 'the record must be gone')
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a handoff record that resumes at least one session is kept to completion', async () => {
+  const { dir, settings } = await fixture()
+  await writeFile(join(dir, HANDOFF_FILE), JSON.stringify({
+    phase: 'prepared',
+    sessionId: 's-good',
+    sessions: [{ id: 's-good', kind: 'initiator' }],
+    reason: 'because',
+    continuePrompt: 'carry on',
+    resumeSubagents: false,
+    createdAt: Date.now(),
+    createdByPid: 1,
+  }), 'utf8')
+  const { ctx, calls } = replayCtx()
+  const resumed = await runHandoff(ctx, settings)
+  assert.deepEqual(resumed, ['s-good'])
+  assert.equal(calls.resumed.length, 1)
+  await rm(dir, { recursive: true, force: true })
+})

@@ -6,6 +6,14 @@
   "description": "Restart the Harness itself and come back: a dedicated restart_dsh tool hands the session over to the next process, which resumes it, replays the pending instruction and wakes the subagents again.",
   "license": "MIT",
   "author": "sadkga",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sadkga/dsh-restart-handoff.git"
+  },
+  "homepage": "https://github.com/sadkga/dsh-restart-handoff#readme",
+  "bugs": {
+    "url": "https://github.com/sadkga/dsh-restart-handoff/issues"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",

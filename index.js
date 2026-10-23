@@ -669,6 +669,17 @@ async function runHandoff(ctx, settings) {
   }
   console.error(`[restart-handoff] replayed the handoff: ${resumed.length} session(s) resumed`)
 
+  if (resumed.length === 0) {
+    // Not one id in this record names a real session. Replaying it is
+    // pointless, and leaving it in place makes EVERY following restart repeat
+    // the same empty replay — observed in production, where a record carrying
+    // the literal id "caller" was re-attempted on each boot. It is not a
+    // handoff this plugin can honour, so it is dropped rather than kept.
+    console.error('[restart-handoff] the handoff record names no resumable session, dropping it')
+    await clearRecord(settings, HANDOFF_FILE)
+    return []
+  }
+
   await writeRecord(settings, HANDOFF_FILE, { ...record, phase: 'resumed', resumedAt: Date.now() })
   await clearRecord(settings, HANDOFF_FILE)
   return resumed.map(entry => entry.agent.id)
