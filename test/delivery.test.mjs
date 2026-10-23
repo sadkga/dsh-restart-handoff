@@ -119,3 +119,61 @@ test('the delivery windows are bounded', () => {
   assert.ok(DELIVERY_CLAIM_TIMEOUT_MS > 0)
   assert.ok(IDLE_WAIT_TIMEOUT_MS > 0)
 })
+
+/**
+ * A running agent that never becomes idle: the state that cost 110s.
+ * @returns {{ agent: Record<string, any>, seen: Record<string, any> }} the double.
+ */
+function busyAgent() {
+  const seen = { idleWaits: 0, cancels: 0, delivered: 0 }
+  const agent = {
+    id: 'busy',
+    status: 'running',
+    inbox: { nextTurn: [], nextStep: [] },
+    whenIdle: () => { seen.idleWaits += 1; return new Promise(() => {}) },
+    followup(message) { seen.delivered += 1; agent.inbox.nextTurn.push(message) },
+    cancel() { seen.cancels += 1 },
+  }
+  return { agent, seen }
+}
+
+test('strategy: a RUNNING agent is delivered to without waiting for idle', async () => {
+  // The parked message is normal: the live driver re-checks hasPending at its
+  // own turn boundary (agent.ts:392). Waiting for idle here was the bug.
+  const { agent, seen } = busyAgent()
+  const started = Date.now()
+  const result = await deliverContinue(agent, 'carry on', { queueSettleMs: 120, claimTimeoutMs: 200, idleTimeoutMs: 200 })
+  const elapsed = Date.now() - started
+  assert.equal(result.claimed, true, 'a queued message on a live driver is a delivery')
+  assert.equal(result.queued, true)
+  assert.equal(seen.idleWaits, 0, 'a running agent must NOT be waited on')
+  assert.equal(seen.cancels, 0, 'and must NOT be cancelled')
+  assert.ok(elapsed < 1000, `it must return promptly, took ${elapsed}ms`)
+})
+
+test('strategy: the running path stays bounded even with a long claim window', async () => {
+  // Guards the regression directly: a running session must never cost the
+  // 60s claim window, let alone a 30s idle wait, per session.
+  const { agent } = busyAgent()
+  const started = Date.now()
+  await deliverContinue(agent, 'carry on', { idleTimeoutMs: 30_000, claimTimeoutMs: 60_000, queueSettleMs: 100 })
+  const elapsed = Date.now() - started
+  assert.ok(elapsed < 2000, `a busy session must not stall the scan, took ${elapsed}ms`)
+})
+
+test('strategy: an IDLE agent still verifies the claim', async () => {
+  const { agent, seen } = fakeAgent()
+  const result = await deliverContinue(agent, 'carry on', { queueSettleMs: 200, claimTimeoutMs: 200, idleTimeoutMs: 200 })
+  assert.equal(result.claimed, true)
+  assert.equal(result.queued, false, 'an idle delivery is claimed, not queued')
+  assert.equal(seen.idleWaits >= 1, true, 'an idle agent is still waited on first')
+})
+
+test('strategy: an idle agent whose message is never claimed is still detected', async () => {
+  // The genuine drop: nothing is running, nothing claims it, nothing will.
+  const { agent, seen } = fakeAgent({ claim: false })
+  const result = await deliverContinue(agent, 'carry on', { queueSettleMs: 100, claimTimeoutMs: 120, idleTimeoutMs: 120 })
+  assert.equal(result.claimed, false)
+  assert.match(result.reason, /NOT CLAIMED/)
+  assert.equal(seen.cancels, 1, 'the drop path still cancels and retries')
+})

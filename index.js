@@ -935,23 +935,45 @@ async function wasSessionCutOff(ctx, sessionId) {
 /**
  * How long a delivered instruction may sit unclaimed before it counts as lost.
  *
- * The window only has to cover "the driver picks the queue up", which is
- * immediate when the agent is idle and one turn-end away when it is finishing
- * one. A minute is far beyond both and still bounded, so a stuck agent is
- * reported instead of hanging the scan.
+ * Only a NON-running agent pays this window: an idle agent claims within
+ * milliseconds, and a running agent is exempt because a parked message is its
+ * normal state. So this bounds the failure case, not the happy one — and it is
+ * paid once per stuck session, which is why it must stay small enough that a
+ * few stuck sessions cannot add up to a stall. Five seconds is already two
+ * orders of magnitude beyond a healthy claim.
  */
-const DELIVERY_CLAIM_TIMEOUT_MS = 60 * 1000
+const DELIVERY_CLAIM_TIMEOUT_MS = 5 * 1000
 
 /**
- * How long to wait for a busy agent to settle before giving up on it.
+ * How long to watch a freshly delivered message before calling it parked.
  *
- * Resuming happens right after the process starts, so a session the restart
- * left mid-turn is still winding down. `whenIdle()` is the host's own
- * definition of quiescence and follows replacement work, so this is the
- * correct thing to wait on — not `status`, which reports `idle` for a
- * maintenance task that will not run a turn.
+ * On an idle agent the driver claims within milliseconds, so this window is
+ * what separates "claimed" from "possibly dropped". On a RUNNING agent a parked
+ * message is the expected state, so this only decides how long to look before
+ * saying so — it must stay short, because it is paid per session.
  */
-const IDLE_WAIT_TIMEOUT_MS = 30 * 1000
+const QUEUE_SETTLE_MS = 1500
+
+/**
+ * How long to wait for an agent to settle before delivering.
+ *
+ * Only a non-running agent reaches this wait. A `maintenance` phase reports
+ * `idle` but runs no turn, and it converges on its own, so waiting is right —
+ * but it must be bounded well below the whole scan budget. Measured: the
+ * previous 30s here is what turned a restart into 110 seconds when several
+ * sessions were busy.
+ */
+const IDLE_WAIT_TIMEOUT_MS = 3 * 1000
+
+/**
+ * The most one delivery may ever cost, retries and cancels included.
+ *
+ * A healthy delivery returns in milliseconds; this only bounds the stuck case,
+ * and it is what keeps the scan's total time independent of how many sessions
+ * are stuck. Measured with the budget: a stuck idle session costs ~6s instead
+ * of the 13s the unbounded stages added up to.
+ */
+const DELIVERY_TOTAL_BUDGET_MS = 6 * 1000
 
 /**
  * Whether one message is still waiting in the agent's inbox.
@@ -987,33 +1009,53 @@ function stillQueued(agent, messageId) {
  *
  * ## What it does instead
  *
- * 1. `whenIdle()` first, so the delivery lands on an idle phase and takes the
- *    unlatched `kick()` path. This is the host's public quiescence contract
- *    and it follows replacement work, unlike `status`, which reports `idle`
- *    for a maintenance task (`:141`).
- * 2. `followup()` — the idle phase always opens the turn boundary.
- * 3. Watch the message LEAVE the inbox. If it is still queued after the claim
- *    window, the wake was dropped: cancel the stuck activity (preserving the
- *    inbox) and re-deliver once, which re-enters `wakeDriver` from idle.
+ * The delivery strategy depends on what the agent is doing, because "still in
+ * the queue" means opposite things in the two states:
+ *
+ *  - `running` — a parked message is NORMAL. The driver re-checks
+ *    `inbox.hasPending` at its own turn boundary (`agent.ts:392`) and starts the
+ *    next turn with whatever is queued, so `followup()` has already done the
+ *    whole job. Waiting for idle here was the bug that cost 110s per restart:
+ *    a busy agent may not be idle for the whole window, and it never needed to
+ *    be. Confirmation is a short observation that the message is queued or
+ *    gone, and then the delivery is done.
+ *  - `idle` — a parked message after a short window means the wake was dropped.
+ *    Only here is cancel-and-retry the right move.
+ *  - maintenance — `status` reports `idle` (:141) but the phase cannot run a
+ *    turn, so this is the one state worth WAITING on rather than cancelling:
+ *    it converges on its own and replays a latched wake.
+ *
+ * `claimed` therefore means "a turn is running, or will run, because of this",
+ * and `queued` records that the message is parked on a live driver on purpose.
  * @param {object} agent - the live agent.
  * @param {string} text - the instruction text.
- * @param {{ idleTimeoutMs?: number, claimTimeoutMs?: number }} [options] - overrides for tests.
- * @returns {Promise<{ delivered: boolean, claimed: boolean, attempts: number, reason: string }>}
- *   `claimed` is the only field that means "a turn is running because of this".
+ * @param {{ idleTimeoutMs?: number, claimTimeoutMs?: number, queueSettleMs?: number }} [options] - overrides for tests.
+ * @returns {Promise<{ delivered: boolean, claimed: boolean, queued: boolean, attempts: number, reason: string }>}
  */
 async function deliverContinue(agent, text, options = {}) {
   const idleTimeoutMs = Number(options.idleTimeoutMs ?? IDLE_WAIT_TIMEOUT_MS)
   const claimTimeoutMs = Number(options.claimTimeoutMs ?? DELIVERY_CLAIM_TIMEOUT_MS)
-  const waitIdle = async () => {
+  const queueSettleMs = Number(options.queueSettleMs ?? QUEUE_SETTLE_MS)
+  // One budget for the WHOLE delivery, so the failure path cannot add up: the
+  // healthy paths return long before it matters, and a stuck session costs at
+  // most this much ONCE however many stages it walks through. Without it the
+  // retry stages stacked (measured 13s per stuck session), and several stuck
+  // sessions turned a restart into a stall.
+  const startedAt = Date.now()
+  const remaining = () => Math.max(0, DELIVERY_TOTAL_BUDGET_MS - (Date.now() - startedAt))
+  const waitIdle = async (timeoutMs = idleTimeoutMs) => {
     if (typeof agent?.whenIdle !== 'function') return 'no-when-idle'
+    const budget = Math.min(timeoutMs, remaining())
+    if (budget <= 0) return 'budget-spent'
     const settled = await Promise.race([
       agent.whenIdle().then(() => 'idle', () => 'idle'),
-      new Promise(resolve => { setTimeout(() => resolve('timeout'), idleTimeoutMs) }),
+      new Promise(resolve => { setTimeout(() => resolve('timeout'), budget) }),
     ])
     return settled
   }
-  const waitClaim = async (messageId) => {
-    const deadline = Date.now() + claimTimeoutMs
+  const waitClaim = async (messageId, timeoutMs = claimTimeoutMs) => {
+    const budget = Math.min(timeoutMs, remaining())
+    const deadline = Date.now() + budget
     while (Date.now() < deadline) {
       if (!stillQueued(agent, messageId)) return true
       await new Promise(resolve => { setTimeout(resolve, 50) })
@@ -1021,40 +1063,55 @@ async function deliverContinue(agent, text, options = {}) {
     return !stillQueued(agent, messageId)
   }
 
-  const idle = await waitIdle()
+  // A busy agent consumes the queue at its own boundary, so waiting for idle
+  // would burn the whole window for nothing. Only a maintenance phase is worth
+  // waiting on: it reports `idle` but runs no turn, and it replays a latched
+  // wake when it converges.
+  const statusBefore = agent?.status
+  const idle = statusBefore === 'running' ? 'skipped:running' : await waitIdle(idleTimeoutMs)
+
   const message = userMessage(text)
   try {
     agent.followup(message)
   } catch (error) {
-    return { delivered: false, claimed: false, attempts: 0, reason: `followup-failed: ${error instanceof Error ? error.message : String(error)}` }
+    return { delivered: false, claimed: false, queued: false, attempts: 0, reason: `followup-failed: ${error instanceof Error ? error.message : String(error)}` }
   }
-  if (await waitClaim(message.id)) return { delivered: true, claimed: true, attempts: 1, reason: `idle=${idle}` }
 
-  // The wake was dropped. Cancel the activity that is holding the phase, keep
-  // the queued instruction, and deliver again from a settling phase.
+  // A live driver owns the queue: either it claims the message (departed) or it
+  // will at its next boundary (parked). Both are delivery, not failure.
+  if (await waitClaim(message.id, queueSettleMs)) {
+    return { delivered: true, claimed: true, queued: false, attempts: 1, reason: `idle=${idle} claimed` }
+  }
+  if (agent?.status === 'running' && stillQueued(agent, message.id)) {
+    return { delivered: true, claimed: true, queued: true, attempts: 1, reason: `idle=${idle} queued for the next turn of the running driver` }
+  }
+  if (await waitClaim(message.id, claimTimeoutMs)) {
+    return { delivered: true, claimed: true, queued: false, attempts: 1, reason: `idle=${idle} claimed after waiting` }
+  }
+
+  // Only now is the message a drop: nothing claimed it and no driver is live.
   try {
     agent.cancel?.({ kind: 'restart-handoff' }, { keepInbox: true })
   } catch (error) {
     console.error('[restart-handoff] could not cancel the stuck activity:', error)
   }
   await waitIdle()
-  if (stillQueued(agent, message.id)) {
-    // The original is still parked: the cancel did not hand it to a driver, so
-    // the phase needs one more nudge to pick the queue up. Re-delivering a
-    // SECOND copy would tell the agent to continue twice, so the retry only
-    // fires when the first message is gone.
-    if (await waitClaim(message.id)) {
-      return { delivered: true, claimed: true, attempts: 1, reason: `idle=${idle} claimed after cancel` }
-    }
+  if (stillQueued(agent, message.id) && await waitClaim(message.id, claimTimeoutMs)) {
+    return { delivered: true, claimed: true, queued: false, attempts: 1, reason: `idle=${idle} claimed after cancel` }
   }
   const retry = userMessage(text)
   try {
     agent.followup(retry)
   } catch (error) {
-    return { delivered: false, claimed: false, attempts: 1, reason: `retry-failed: ${error instanceof Error ? error.message : String(error)}` }
+    return { delivered: false, claimed: false, queued: false, attempts: 1, reason: `retry-failed: ${error instanceof Error ? error.message : String(error)}` }
   }
-  if (await waitClaim(retry.id)) return { delivered: true, claimed: true, attempts: 2, reason: `idle=${idle} retried` }
-  return { delivered: true, claimed: false, attempts: 2, reason: `idle=${idle} NOT CLAIMED: the wake was dropped and the retry did not take` }
+  if (await waitClaim(retry.id, claimTimeoutMs)) {
+    return { delivered: true, claimed: true, queued: false, attempts: 2, reason: `idle=${idle} retried` }
+  }
+  if (stillQueued(agent, retry.id) && agent?.status === 'running') {
+    return { delivered: true, claimed: true, queued: true, attempts: 2, reason: `idle=${idle} queued for the next turn of the running driver (after retry)` }
+  }
+  return { delivered: true, claimed: false, queued: false, attempts: 2, reason: `idle=${idle} NOT CLAIMED: the wake was dropped and the retry did not take` }
 }
 
 /**
@@ -1275,6 +1332,18 @@ function tailCutOffReason(events) {
   if (endReason?.kind === 'interrupted') return { cutOff: true, reason: 'interrupted' }
   if (endReason?.kind === 'aborted' && endReason.reason?.kind === 'disposed') {
     return { cutOff: true, reason: 'aborted+disposed' }
+  }
+  // Corroboration for a tail turn that reports no reason. `cutOffReason` does
+  // this over the whole log, and the two criteria must never disagree on a log
+  // they both see. Measured on the live store they agree on 134/134 sessions,
+  // but that agreement must not depend on every tail happening to carry a
+  // reason: a window that holds an interrupted message for the NEWEST turn
+  // holds exactly the evidence the whole log would have used.
+  if (endReason?.kind === undefined) {
+    const interruptedTail = list.some(event => event?.type === 'assistant/message'
+      && event?.data?.interrupted === true
+      && (startTurn === undefined || event?.data?.turn === startTurn))
+    if (interruptedTail) return { cutOff: true, reason: 'interrupted-message' }
   }
   return { cutOff: false, reason: endReason?.kind === undefined ? 'no-turn-end' : String(endReason.kind) }
 }
@@ -2018,8 +2087,10 @@ export function apply(ctx, config = {}) {
  */
 export const internals = {
   DELIVERY_CLAIM_TIMEOUT_MS,
+  DELIVERY_TOTAL_BUDGET_MS,
   DEFAULTS,
   IDLE_WAIT_TIMEOUT_MS,
+  QUEUE_SETTLE_MS,
   STALE_PRE_FILTER_SLACK_MS,
   HANDOFF_FILE,
   PENDING_FILE,
