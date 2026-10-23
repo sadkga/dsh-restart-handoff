@@ -170,16 +170,22 @@ an executor call (`execSync('pkill -f node')`,
 `subprocess.run(['kill', '-1'])`, `tools.bash({ command: 'pkill -f node' })`),
 because their argument runs exactly what a shell segment would.
 
-最后，插件跑在**宿主进程内部**，所以 `process.pid` 就是宿主的 pid。对那个 pid 直接执行 kill 会被字面匹配拦下。但**间接取 pid 的写法拦不住** —— `P=$(pgrep …) && kill $P`、`kill $(pgrep …)` 里的那个数字并不出现在命令文本中，静态规则看不见它：
+最后，插件跑在**宿主进程内部**，所以它知道宿主从外面看是什么样子：它的 pid、它的父进程，以及**它启动时的那条命令行**。于是判据不再是"文本里有没有那个数字"，而是"这条查找命令按它自己的匹配规则，会不会选中宿主"：
 
 | 写法 | 结果 |
 | --- | --- |
 | `kill -TERM <宿主的字面 pid>` | 拦住 |
 | `kill $PPID` | 拦住 |
-| `P=$(pgrep …) && kill -TERM $P` | **放行** |
-| `kill $(pgrep …)` | **放行** |
+| `P=$(pgrep -f "apps/cli/src/bin.ts web") && kill -TERM $P` | 拦住 |
+| `kill $(pgrep -f "apps/cli/src/bin.ts web")` | 拦住 |
+| `pkill -f node` | 拦住 |
+| `kill 0`（杀整个进程组） | 拦住 |
+| `P=$(pgrep -f "my-unrelated-service") && kill -TERM $P` | 放行 |
+| `kill -9 12345`（某个具名进程） | 放行 |
+| `kill -- -12345`（宿主以外���进程组） | 放行 |
+| `pgrep -f "apps/cli/src/bin.ts web"`（只查看，不发信号） | 放行 |
 
-这是文本规则的边界，不是疏漏。要把 pid 藏起来并不难（变量拼接、base64、脚本文件），任何命令文本匹配都能被绕过。**真正的兜底是另一件事：无论进程是被杀、被崩还是断电，插件都会把正在跑的会话、子代理和队友带回来** —— 围栏只是引导和后果说明，恢复机制才是保证。
+这是 shell 自己的匹配规则，不是猜测：`pkill -f` 拿 pattern 去匹配每个进程的**完整命令行**，所以凡是 pattern 出现在宿主命令行里的查找，必然会选中宿主；反之，查找一个无关进程是日常工作，必须放行。**要绕过它仍然不难**（base64、脚本文件、把 pid 编码进变量），所以围栏的定位始终是引导和后果说明 —— **真正的兜底是恢复机制：无论宿主是被杀、被崩还是断电，正在跑的会话、子代理和队友都会回来。**
 
 #### 保真：会话回来时还是它自己
 
@@ -211,7 +217,8 @@ because their argument runs exactly what a shell segment would.
 
 ### 已知边界
 
-* **围栏是引导，不是隔离。** 它匹配命令文本，原则上可以被混淆绕过（`base64 -d | sh`、变量拼接）。它的价值在于把模型引导到 `restart_dsh` 并解释后果；真正的隔离需要 PATH 白名单或独立 cgroup，那属于宿主改动。**真正的兜底是：即便宿主被杀，工作也会回来** —— 非计划恢复那条路不在乎进程是怎么死的。
+* **围栏是引导，不是隔离。** 它匹配命令文本，所以原则上仍能被混淆绕过（`base64 -d | sh`、把 pid 编码进变量、藏进脚本文件）。它的价值在于把模型引导到 `restart_dsh` 并解释后果；真正的隔离需要 PATH 白名单或独立 cgroup，那属于宿主改动。**真正的兜底是：即便宿主被杀，工作也会回来** —— 非计划恢复那条路不在乎进程是怎么死的。
+* **它认得出"指向宿主"，但认不出"藏起来的宿主"。** 围栏跑在宿主内部，因此知道宿主的 pid 和命令行；凡是按 shell 自己的匹配规则会选中宿主的查找 + 信号，都会被拦下。但把 pid 藏进变量或脚本之后，它就看不见了 —— 那种情况下靠的是恢复机制，不是围栏。
 * **名字里没有「执行」二字的工具一律当数据工具。** 它的载荷不当命令判，所以第三方插件里那些「把收到的字符串当命令执行」的工具在围栏够不着的地方。shell、终端和代码执行器这些通道 —— 模型真正用来重启宿主的那些 —— 是覆盖到的。
 * **子代理是因为它的日志被打断才被唤醒，不是因为它的模式。** `continuable` 子会话和 `one-shot` 子会话一视同仁：如果它自己的日志显示有未闭合的轮次，就被唤醒并被告知接着干。跑完的子会话没有活可接，继续睡。
 * **人主动停下的会话不会回来。** `aborted` + `user` 被明确排除，`completed` 和 `error` 也是 —— 除非收件箱里还排着一个从未开始的提示。
@@ -481,24 +488,33 @@ an executor call (`execSync('pkill -f node')`,
 `subprocess.run(['kill', '-1'])`, `tools.bash({ command: 'pkill -f node' })`),
 because their argument runs exactly what a shell segment would.
 
-Finally, the plugin runs *inside* the Host process, so `process.pid` is the
-Host's pid, and `kill <that pid>` is denied by literal match. What the rule
-cannot see is a pid that never appears in the text: `P=$(pgrep …) && kill $P`
-and `kill $(pgrep …)` both get through.
+Finally, the plugin runs *inside* the Host process, so it knows what the Host
+looks like from the outside: its pid, its parent, and **the command line it was
+started with**. The rule is therefore no longer "does the number appear in the
+text" but "would this lookup, by the shell's own matching rule, select the
+Host":
 
 | Form | Result |
 | --- | --- |
 | `kill -TERM <the Host's literal pid>` | denied |
 | `kill $PPID` | denied |
-| `P=$(pgrep …) && kill -TERM $P` | **allowed** |
-| `kill $(pgrep …)` | **allowed** |
+| `P=$(pgrep -f "apps/cli/src/bin.ts web") && kill -TERM $P` | denied |
+| `kill $(pgrep -f "apps/cli/src/bin.ts web")` | denied |
+| `pkill -f node` | denied |
+| `kill 0` (the caller's whole process group) | denied |
+| `P=$(pgrep -f "my-unrelated-service") && kill -TERM $P` | allowed |
+| `kill -9 12345` (one named process) | allowed |
+| `kill -- -12345` (a process group other than the Host's) | allowed |
+| `pgrep -f "apps/cli/src/bin.ts web"` (a lookup, no signal) | allowed |
 
-That is the boundary of a text rule, not an oversight: hiding a pid is easy
-(variable concatenation, base64, a script file), and every command-text match
-can be walked around. **The real backstop is something else: whether the
-process is killed, crashes, or loses power, the plugin brings the running
-sessions, their subagents and their team members back.** The guard steers and
-explains; the recovery is what guarantees.
+That is the shell's own matching rule, not a guess: `pkill -f` matches the
+pattern against every process's **full command line**, so any pattern occurring
+in the Host's command line selects the Host — and a lookup for an unrelated
+process is ordinary work that must stay allowed. **Walking around it is still
+easy** (base64, a script file, a pid encoded into a variable), so the guard's
+role remains steering and explanation — **the backstop is the recovery: whether
+the Host is killed, crashes, or loses power, the running sessions, their
+subagents and their team members come back.**
 
 ### Fidelity: the session comes back as it was
 
@@ -555,12 +571,17 @@ Two known costs sit outside this plugin's reach:
 ## Known boundaries
 
 * **The guard is guidance, not isolation.** It matches command text, so it can
-  in principle be obfuscated (`base64 -d | sh`, variable concatenation). Its
-  value is that it steers the model to `restart_dsh` and explains the
-  consequence; real isolation needs a PATH allowlist or a separate cgroup,
-  which is a Host change. **The real backstop is that the work comes back
-  even when the Host is killed** — the unplanned-recovery path does not care
-  how the process died.
+  in principle be obfuscated (`base64 -d | sh`, a pid encoded into a variable,
+  a script file). Its value is that it steers the model to `restart_dsh` and
+  explains the consequence; real isolation needs a PATH allowlist or a separate
+  cgroup, which is a Host change. **The real backstop is that the work comes
+  back even when the Host is killed** — the unplanned-recovery path does not
+  care how the process died.
+* **It recognises "aimed at the Host" but not "the Host, hidden".** The guard
+  runs inside the Host, so it knows the Host's pid and command line; any lookup
+  that would select it by the shell's own rule, followed by a signal, is
+  denied. Hide the pid in a variable or a script and it is out of sight — and
+  then the recovery path is what carries the work, not the guard.
 * **A tool whose name does not say it executes anything is treated as a data
   tool.** Its payload is not judged as a command, so a third-party plugin tool
   that executes an arbitrary string it received in a payload is outside the
