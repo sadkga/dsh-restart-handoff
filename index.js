@@ -834,16 +834,24 @@ function balanceLog(events) {
 /**
  * Whether a session log was cut off mid-turn, and why.
  *
- * Four durable fingerprints, any one of which means the session was lost with
- * work in flight:
+ * Three durable fingerprints of the TAIL turn, any one of which means the
+ * session was lost with work in flight:
  *  - an unclosed turn (the last `turn/start` has no `turn/end`) — the writer
  *    never got to close it;
  *  - the last `turn/end` is `interrupted` — the session layer closed an
  *    orphaned turn after the fact;
  *  - the last `turn/end` is `aborted` with a `disposed` cause — the process
- *    was torn down mid-turn;
- *  - a committed `assistant/message` carrying `interrupted: true` — the model
- *    was cut off mid-stream and the partial message is in the log.
+ *    was torn down mid-turn.
+ *
+ * A committed `assistant/message` carrying `interrupted: true` is NOT a
+ * fingerprint on its own, and deliberately so: it is a HISTORICAL trace. One
+ * long conversation accumulates dozens of them (a stream the user stopped, a
+ * retried attempt), so treating the marker as a standalone criterion
+ * resurrects essentially the whole corpus — measured on the live store, 38
+ * root sessions, which is exactly the over-recovery the user rejected. It
+ * only corroborates the ONE case where the tail says nothing: the log ends on
+ * a `turn/end` whose reason is missing or unknown AND the last message of
+ * that turn was marked interrupted.
  *
  * A turn the human stopped (`aborted` + `user`), one that finished
  * (`completed`), one that failed (`error`) and one that hit the token ceiling
@@ -866,8 +874,16 @@ function cutOffReason(events) {
   if (endReason?.kind === 'aborted' && endReason.reason?.kind === 'disposed') {
     return { cutOff: true, reason: 'aborted+disposed' }
   }
-  const interruptedMessage = list.some(event => event?.type === 'assistant/message' && event?.data?.interrupted === true)
-  if (interruptedMessage) return { cutOff: true, reason: 'interrupted-message' }
+  // Corroboration only, and only where the tail is silent: an unmarked
+  // interrupted message says nothing about a turn that already reported a
+  // reason of its own.
+  if (endReason?.kind === undefined) {
+    const lastTurn = began.at(-1)?.data?.turn
+    const interruptedTail = list.some(event => event?.type === 'assistant/message'
+      && event?.data?.interrupted === true
+      && (lastTurn === undefined || event?.data?.turn === lastTurn))
+    if (interruptedTail) return { cutOff: true, reason: 'interrupted-message' }
+  }
   return { cutOff: false, reason: endReason?.kind === undefined ? 'no-turn-end' : String(endReason.kind) }
 }
 

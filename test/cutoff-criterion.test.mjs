@@ -71,13 +71,38 @@ test('criterion2: an aborted turn with a disposed cause is cut off', () => {
   assert.deepEqual(cutOffReason(events), { cutOff: true, reason: 'aborted+disposed' })
 })
 
-test('criterion2: an assistant message marked interrupted is cut off', () => {
+test('criterion2: an interrupted message alone does NOT resurrect a finished turn', () => {
+  // `interrupted: true` is a HISTORICAL trace: one long conversation holds
+  // dozens of them (a stopped stream, a retried attempt). Treating it as a
+  // standalone fingerprint resurrects the whole corpus — measured on the live
+  // store that was 38 root sessions, the exact over-recovery the user
+  // rejected. A turn that reported its own reason must be believed.
   const events = [
     event('turn/start', { turn: 1 }, 0),
     event('assistant/message', { turn: 1, step: 1, message: {}, interrupted: true }, 1),
     event('turn/end', { turn: 1, reason: { kind: 'completed' } }, 2),
   ]
+  assert.equal(cutOffReason(events).cutOff, false)
+})
+
+test('criterion2: an interrupted tail message corroborates a reasonless turn/end', () => {
+  const events = [
+    event('turn/start', { turn: 1 }, 0),
+    event('assistant/message', { turn: 1, step: 1, message: {}, interrupted: true }, 1),
+    event('turn/end', { turn: 1 }, 2),
+  ]
   assert.deepEqual(cutOffReason(events), { cutOff: true, reason: 'interrupted-message' })
+})
+
+test('criterion2: an interrupted message from an EARLIER turn does not count', () => {
+  const events = [
+    event('turn/start', { turn: 1 }, 0),
+    event('assistant/message', { turn: 1, step: 1, message: {}, interrupted: true }, 1),
+    event('turn/end', { turn: 1, reason: { kind: 'completed' } }, 2),
+    event('turn/start', { turn: 2 }, 3),
+    event('turn/end', { turn: 2 }, 4),
+  ]
+  assert.equal(cutOffReason(events).cutOff, false)
 })
 
 test('criterion2: a turn the human stopped is finished', () => {
