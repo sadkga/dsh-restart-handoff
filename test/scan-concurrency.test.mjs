@@ -64,15 +64,31 @@ test('mapBounded: never runs more tasks at once than the cap', async () => {
   let inFlight = 0
   let peak = 0
   const items = Array.from({ length: 24 }, (_, index) => index)
+  // Overlap is ARRANGED, not hoped for. A task blocks on a gate that only opens
+  // once four tasks are simultaneously in flight, so the peak is reached by
+  // construction: `setTimeout`-based sleeps raced the scheduler and let four
+  // tasks finish one after another, which made `peak > 1` flaky.
+  let release
+  const gate = new Promise(resolve => { release = resolve })
   const task = async () => {
     inFlight += 1
     peak = Math.max(peak, inFlight)
-    await new Promise(resolve => setTimeout(resolve, 1))
-    inFlight -= 1
+    if (inFlight >= 4) release()
+    try {
+      // Every task waits for the gate, so all four stay in flight together.
+      // The timeout is a FAILSAFE only: if the pool never reaches four at once
+      // the batch would hang, so it opens the gate and lets the assertion below
+      // report the real peak rather than timing out the whole test run.
+      await Promise.race([gate, new Promise(resolve => setTimeout(resolve, 5000))])
+    } finally {
+      inFlight -= 1
+    }
     return true
   }
   await mapBounded(items, 4, task)
   assert.ok(peak <= 4, `peak concurrency ${peak} exceeded the cap of 4`)
+  // Deterministic: the first four tasks cannot finish until the fourth has
+  // started, because each awaits a gate the fourth resolves.
   assert.ok(peak > 1, `the pool never overlapped work (peak ${peak})`)
 })
 
