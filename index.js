@@ -941,6 +941,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     console.error('[restart-handoff] could not list the sessions:', error)
     return []
   }
+  const skipped = { noId: 0, child: 0, live: 0, replayed: 0 }
   const recovered = []
   const maxAgeMs = Number(settings.recoverMaxAgeMs ?? DEFAULTS.recoverMaxAgeMs)
   const maxSessions = Number(settings.recoverMaxSessions ?? DEFAULTS.recoverMaxSessions)
@@ -956,10 +957,26 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
   records = [...records].sort((a, b) => (b?.header?.createdAt ?? 0) - (a?.header?.createdAt ?? 0))
   for (const record of records) {
     const id = record?.id ?? record?.header?.id
-    if (typeof id !== 'string' || id === '') continue
-    if (record?.header?.parentSession !== undefined) continue
-    if (record?.live === true) continue
-    if (alreadyResumed.includes(id)) continue
+    if (typeof id !== 'string' || id === '') {
+      skipped.noId += 1
+      console.error('[restart-handoff] scan: <no id> skipped (no id)')
+      continue
+    }
+    if (record?.header?.parentSession !== undefined) {
+      skipped.child += 1
+      console.error(`[restart-handoff] scan: ${id} skipped (child session)`)
+      continue
+    }
+    if (record?.live === true) {
+      skipped.live += 1
+      console.error(`[restart-handoff] scan: ${id} skipped (already live)`)
+      continue
+    }
+    if (alreadyResumed.includes(id)) {
+      skipped.replayed += 1
+      console.error(`[restart-handoff] scan: ${id} skipped (replayed by the handoff)`)
+      continue
+    }
     if (archived?.has(id)) {
       console.error(`[restart-handoff] scan: ${id} skipped (archived)`)
       continue
@@ -1017,7 +1034,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     recovered.push(id)
     console.error(`[restart-handoff] scan: ${id} restored (${cutOff.cutOff ? cutOff.reason : 'queued-work'}) woken=${woken.length}`)
   }
-  console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length}`)
+  console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length} skipped-live=${skipped.live} skipped-child=${skipped.child} skipped-replayed=${skipped.replayed} skipped-noId=${skipped.noId}`)
   return recovered
 }
 
