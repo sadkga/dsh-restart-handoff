@@ -170,7 +170,16 @@ an executor call (`execSync('pkill -f node')`,
 `subprocess.run(['kill', '-1'])`, `tools.bash({ command: 'pkill -f node' })`),
 because their argument runs exactly what a shell segment would.
 
-最后，插件跑在**宿主进程内部**，所以 `process.pid` 就是宿主的 pid。对那个 pid 执行 kill 会被字面匹配拦下 —— 它堵死了两步式自杀（先 `pgrep` 再 `kill`），那是任何文本规则都抓不到的。
+最后，插件跑在**宿主进程内部**，所以 `process.pid` 就是宿主的 pid。对那个 pid 直接执行 kill 会被字面匹配拦下。但**间接取 pid 的写法拦不住** —— `P=$(pgrep …) && kill $P`、`kill $(pgrep …)` 里的那个数字并不出现在命令文本中，静态规则看不见它：
+
+| 写法 | 结果 |
+| --- | --- |
+| `kill -TERM <宿主的字面 pid>` | 拦住 |
+| `kill $PPID` | 拦住 |
+| `P=$(pgrep …) && kill -TERM $P` | **放行** |
+| `kill $(pgrep …)` | **放行** |
+
+这是文本规则的边界，不是疏漏。要把 pid 藏起来并不难（变量拼接、base64、脚本文件），任何命令文本匹配都能被绕过。**真正的兜底是另一件事：无论进程是被杀、被崩还是断电，插件都会把正在跑的会话、子代理和队友带回来** —— 围栏只是引导和后果说明，恢复机制才是保证。
 
 #### 保真：会话回来时还是它自己
 
@@ -473,9 +482,23 @@ an executor call (`execSync('pkill -f node')`,
 because their argument runs exactly what a shell segment would.
 
 Finally, the plugin runs *inside* the Host process, so `process.pid` is the
-Host's pid. `kill <that pid>` is denied by literal match — it closes the
-two-step suicide (`pgrep` first, `kill` second) that no text rule could
-otherwise catch.
+Host's pid, and `kill <that pid>` is denied by literal match. What the rule
+cannot see is a pid that never appears in the text: `P=$(pgrep …) && kill $P`
+and `kill $(pgrep …)` both get through.
+
+| Form | Result |
+| --- | --- |
+| `kill -TERM <the Host's literal pid>` | denied |
+| `kill $PPID` | denied |
+| `P=$(pgrep …) && kill -TERM $P` | **allowed** |
+| `kill $(pgrep …)` | **allowed** |
+
+That is the boundary of a text rule, not an oversight: hiding a pid is easy
+(variable concatenation, base64, a script file), and every command-text match
+can be walked around. **The real backstop is something else: whether the
+process is killed, crashes, or loses power, the plugin brings the running
+sessions, their subagents and their team members back.** The guard steers and
+explains; the recovery is what guarantees.
 
 ### Fidelity: the session comes back as it was
 
