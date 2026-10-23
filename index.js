@@ -691,6 +691,7 @@ async function wakeSubagents(ctx, sessionId, record) {
   // Team's own wording. Waking it here as well would tell the same child to
   // continue twice, once queued and once steered.
   const teamMembers = await teamMemberIds(ctx, ctx.get('agents')?.get?.(sessionId))
+  console.error(`[restart-handoff] wake: parent=${sessionId} descendants=${descendants.length} team=${teamMembers.size}`)
   // WHO to wake is decided by the child's own log, never by its mode: a
   // one-shot child that was cut off mid-turn has work in flight just like a
   // continuable one, and a child that finished must not be woken at all.
