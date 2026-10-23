@@ -648,7 +648,13 @@ async function runHandoff(ctx, settings) {
     const text = entry.kind === 'peer'
       ? `${intro} Your session was resumed and the other running sessions were resumed too. Continue the work you had in flight.`
       : `${intro} Continue the work below.\n\n${record.continuePrompt}`
-    agent.followup(userMessage(text))
+    // A freshly resumed agent may already be carrying work (the resume itself
+    // can open a turn), so the same claim check applies here: a delivery that
+    // was never claimed must not be reported as a replay.
+    const delivery = await deliverContinue(agent, text)
+    if (!delivery.claimed) {
+      console.error(`[restart-handoff] WARNING: the handoff instruction was not claimed for ${sessionId}: ${delivery.reason}`)
+    }
     // The fate of one planned session, on its own line: it was resumed, and
     // this is how many of its subagents were woken. A restored parent whose
     // count is 0 was resumed for its own in-flight work (or as the durable
@@ -926,6 +932,131 @@ async function wasSessionCutOff(ctx, sessionId) {
 }
 
 /**
+ * How long a delivered instruction may sit unclaimed before it counts as lost.
+ *
+ * The window only has to cover "the driver picks the queue up", which is
+ * immediate when the agent is idle and one turn-end away when it is finishing
+ * one. A minute is far beyond both and still bounded, so a stuck agent is
+ * reported instead of hanging the scan.
+ */
+const DELIVERY_CLAIM_TIMEOUT_MS = 60 * 1000
+
+/**
+ * How long to wait for a busy agent to settle before giving up on it.
+ *
+ * Resuming happens right after the process starts, so a session the restart
+ * left mid-turn is still winding down. `whenIdle()` is the host's own
+ * definition of quiescence and follows replacement work, so this is the
+ * correct thing to wait on — not `status`, which reports `idle` for a
+ * maintenance task that will not run a turn.
+ */
+const IDLE_WAIT_TIMEOUT_MS = 30 * 1000
+
+/**
+ * Whether one message is still waiting in the agent's inbox.
+ *
+ * `inbox.nextTurn` / `inbox.nextStep` are the host's public pending lists and
+ * are exactly what `hasPending` folds. Watching the message leave is the only
+ * honest proof that the driver claimed it: `followup()` returning cleanly
+ * proves only that the splice succeeded.
+ * @param {object} agent - the live agent.
+ * @param {string} messageId - the identity of the delivered message.
+ * @returns {boolean} true while the message is still queued.
+ */
+function stillQueued(agent, messageId) {
+  const pending = [...(agent?.inbox?.nextTurn ?? []), ...(agent?.inbox?.nextStep ?? [])]
+  return pending.some(message => message?.id === messageId)
+}
+
+/**
+ * Deliver a continue instruction to a LIVE agent and verify it actually runs.
+ *
+ * ## Why a bare `followup()` is not enough
+ *
+ * `followup()` splices the message into the inbox and then calls
+ * `wakeDriver()`. In `packages/core/agent-loop/src/agent.ts:214` a wake while
+ * `phase.kind !== 'idle'` does not start a turn: it is latched ONLY for
+ * `maintenance` or for a wake whose activity is already aborted (`:220-223`).
+ * A live `running` driver is expected to claim the queue itself, but it does so
+ * only after it reaches its own `if (!this.inbox.hasPending) return false`
+ * check (`:392`). A message spliced after that check while the phase is still
+ * `running` is therefore claimed by nobody — and nothing throws, so the log
+ * says the nudge was delivered while no turn ever starts. That is the silent
+ * failure this helper exists to close.
+ *
+ * ## What it does instead
+ *
+ * 1. `whenIdle()` first, so the delivery lands on an idle phase and takes the
+ *    unlatched `kick()` path. This is the host's public quiescence contract
+ *    and it follows replacement work, unlike `status`, which reports `idle`
+ *    for a maintenance task (`:141`).
+ * 2. `followup()` — the idle phase always opens the turn boundary.
+ * 3. Watch the message LEAVE the inbox. If it is still queued after the claim
+ *    window, the wake was dropped: cancel the stuck activity (preserving the
+ *    inbox) and re-deliver once, which re-enters `wakeDriver` from idle.
+ * @param {object} agent - the live agent.
+ * @param {string} text - the instruction text.
+ * @param {{ idleTimeoutMs?: number, claimTimeoutMs?: number }} [options] - overrides for tests.
+ * @returns {Promise<{ delivered: boolean, claimed: boolean, attempts: number, reason: string }>}
+ *   `claimed` is the only field that means "a turn is running because of this".
+ */
+async function deliverContinue(agent, text, options = {}) {
+  const idleTimeoutMs = Number(options.idleTimeoutMs ?? IDLE_WAIT_TIMEOUT_MS)
+  const claimTimeoutMs = Number(options.claimTimeoutMs ?? DELIVERY_CLAIM_TIMEOUT_MS)
+  const waitIdle = async () => {
+    if (typeof agent?.whenIdle !== 'function') return 'no-when-idle'
+    const settled = await Promise.race([
+      agent.whenIdle().then(() => 'idle', () => 'idle'),
+      new Promise(resolve => { setTimeout(() => resolve('timeout'), idleTimeoutMs) }),
+    ])
+    return settled
+  }
+  const waitClaim = async (messageId) => {
+    const deadline = Date.now() + claimTimeoutMs
+    while (Date.now() < deadline) {
+      if (!stillQueued(agent, messageId)) return true
+      await new Promise(resolve => { setTimeout(resolve, 50) })
+    }
+    return !stillQueued(agent, messageId)
+  }
+
+  const idle = await waitIdle()
+  const message = userMessage(text)
+  try {
+    agent.followup(message)
+  } catch (error) {
+    return { delivered: false, claimed: false, attempts: 0, reason: `followup-failed: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  if (await waitClaim(message.id)) return { delivered: true, claimed: true, attempts: 1, reason: `idle=${idle}` }
+
+  // The wake was dropped. Cancel the activity that is holding the phase, keep
+  // the queued instruction, and deliver again from a settling phase.
+  try {
+    agent.cancel?.({ kind: 'restart-handoff' }, { keepInbox: true })
+  } catch (error) {
+    console.error('[restart-handoff] could not cancel the stuck activity:', error)
+  }
+  await waitIdle()
+  if (stillQueued(agent, message.id)) {
+    // The original is still parked: the cancel did not hand it to a driver, so
+    // the phase needs one more nudge to pick the queue up. Re-delivering a
+    // SECOND copy would tell the agent to continue twice, so the retry only
+    // fires when the first message is gone.
+    if (await waitClaim(message.id)) {
+      return { delivered: true, claimed: true, attempts: 1, reason: `idle=${idle} claimed after cancel` }
+    }
+  }
+  const retry = userMessage(text)
+  try {
+    agent.followup(retry)
+  } catch (error) {
+    return { delivered: false, claimed: false, attempts: 1, reason: `retry-failed: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  if (await waitClaim(retry.id)) return { delivered: true, claimed: true, attempts: 2, reason: `idle=${idle} retried` }
+  return { delivered: true, claimed: false, attempts: 2, reason: `idle=${idle} NOT CLAIMED: the wake was dropped and the retry did not take` }
+}
+
+/**
  * Safety margin added to the harvest window before a `stat` may skip a session.
  *
  * The pre-filter compares a log file's mtime against the last event's `time`,
@@ -1042,6 +1173,57 @@ async function staleByLogMtime(sessionId, cwd, now, maxAgeMs) {
 }
 
 /**
+ * How many session logs the scan reads at once.
+ *
+ * Each read is a decompress-and-parse of a whole log, so it is I/O- and
+ * CPU-bound rather than latency-bound: one read of a 20k-event session costs
+ * seconds on its own. A small pool overlaps those reads without flooding the
+ * disk or holding dozens of multi-megabyte event arrays in memory at once —
+ * four is enough to keep the disk busy while bounding peak memory to roughly
+ * four logs.
+ */
+const SESSION_READ_CONCURRENCY = 4
+
+/**
+ * Run `task` over `items` with at most `concurrency` in flight, IN ORDER.
+ *
+ * The result is positionally stable: `results[i]` is the outcome for
+ * `items[i]` however the reads interleave, and a rejected task is reported at
+ * its own index instead of aborting the batch. That is what makes the pool a
+ * performance change only — the caller walks `results` in the original order
+ * and reaches the same verdicts a serial loop would.
+ *
+ * Workers take items from one shared cursor, so a worker that finishes early
+ * picks up the next item in decision order; nothing about the ORDER of the
+ * results depends on which worker ran what.
+ * @template T, R
+ * @param {readonly T[]} items - the work items, in decision order.
+ * @param {number} concurrency - the maximum number of tasks in flight.
+ * @param {(item: T, index: number) => Promise<R>} task - the work per item.
+ * @returns {Promise<Array<{ ok: true, value: R } | { ok: false, error: unknown }>>}
+ *   one outcome per item, in the input order.
+ */
+async function mapBounded(items, concurrency, task) {
+  const results = new Array(items.length)
+  const width = Math.max(1, Math.min(Math.floor(concurrency) || 1, items.length))
+  let next = 0
+  const run = async () => {
+    for (;;) {
+      const index = next
+      next += 1
+      if (index >= items.length) return
+      try {
+        results[index] = { ok: true, value: await task(items[index], index) }
+      } catch (error) {
+        results[index] = { ok: false, error }
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: width }, run))
+  return results
+}
+
+/**
  * Recover the sessions a crashed process left behind.
  *
  * A planned restart leaves a handoff record. A crash, a kill, or any other
@@ -1117,13 +1299,20 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       const verdict = await wasSessionCutOff(ctx, id)
       if (verdict.cutOff && liveAgent !== undefined && typeof liveAgent.followup === 'function') {
         try {
-          const queued = userMessage('The Harness process went down unexpectedly. Your session is open again — continue the work that was in flight.')
-          liveAgent.followup(queued)
-          nudged = true
+          // NOT a bare `followup()`: a wake sent while the driver is live but
+          // past its last `hasPending` check is dropped without an error. The
+          // helper waits for quiescence, delivers, and proves the message was
+          // claimed before reporting success.
+          const delivery = await deliverContinue(
+            liveAgent,
+            'The Harness process went down unexpectedly. Your session is open again — continue the work that was in flight.',
+          )
+          nudged = delivery.claimed
           const inboxAfter = liveAgent?.inbox
-          const pendingNow = (inboxAfter?.nextTurn?.length ?? 0) + (inboxAfter?.nextStep?.length ?? 0)
-          if (pendingNow === 0) console.error(`[restart-handoff] WARNING: the nudge never landed in the inbox of ${id}`)
-          console.error(`[restart-handoff] scan: ${id} already live, told to continue (${verdict.reason}) status=${liveAgent?.status} nextTurn=${inboxAfter?.nextTurn?.length ?? '?'} running=${typeof liveAgent?.status === 'string' ? liveAgent.status : '?'}`)
+          if (!delivery.claimed) {
+            console.error(`[restart-handoff] WARNING: the nudge was not claimed for ${id}: ${delivery.reason}`)
+          }
+          console.error(`[restart-handoff] scan: ${id} already live, told to continue (${verdict.reason}) status=${liveAgent?.status} claimed=${delivery.claimed} attempts=${delivery.attempts} nextTurn=${inboxAfter?.nextTurn?.length ?? '?'} ${delivery.reason}`)
         } catch (error) {
           console.error(`[restart-handoff] could not nudge the live session ${id}:`, error)
         }
@@ -1203,7 +1392,15 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       console.error(`[restart-handoff] scan: ${id} NOT RESTORED (resume failed)`)
       continue
     }
-    agent.followup(userMessage('The Harness process went down unexpectedly and your session was resumed. Continue the work that was in flight.'))
+    // Verified delivery: the session is only counted as recovered when the
+    // continue instruction actually left the inbox (was claimed by a turn).
+    const delivery = await deliverContinue(
+      agent,
+      'The Harness process went down unexpectedly and your session was resumed. Continue the work that was in flight.',
+    )
+    if (!delivery.claimed) {
+      console.error(`[restart-handoff] WARNING: the recovery instruction was not claimed for ${id}: ${delivery.reason}`)
+    }
     const woken = await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
     // A teammate is not a subagent: the Team roster owns it, and it is woken
     // through the Team path. The handoff replay has always done this; the
@@ -1545,7 +1742,9 @@ export function apply(ctx, config = {}) {
  * Internals exported for the unit tests; not part of the plugin's contract.
  */
 export const internals = {
+  DELIVERY_CLAIM_TIMEOUT_MS,
   DEFAULTS,
+  IDLE_WAIT_TIMEOUT_MS,
   STALE_PRE_FILTER_SLACK_MS,
   HANDOFF_FILE,
   PENDING_FILE,
@@ -1557,6 +1756,7 @@ export const internals = {
   createRestartTool,
   cutOffReason,
   dangerousSegments,
+  deliverContinue,
   encodeSegment,
   hasPendingWork,
   headVerb,
@@ -1575,6 +1775,7 @@ export const internals = {
   runHandoff,
   selfKillSegments,
   staleByLogMtime,
+  stillQueued,
   teamMemberIds,
   wakeSubagents,
   wakeTeamMembers,
