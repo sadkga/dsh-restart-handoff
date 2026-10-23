@@ -1,5 +1,6 @@
 import { join as pathJoin } from 'node:path'
-import { readFile as fsReadFile, writeFile as fsWriteFile, mkdir as fsMkdir, rename as fsRename, rm as fsRm, stat as fsStat } from 'node:fs/promises'
+import { zstdDecompressSync } from 'node:zlib'
+import { readFile as fsReadFile, writeFile as fsWriteFile, mkdir as fsMkdir, rename as fsRename, rm as fsRm, stat as fsStat, open as fsOpen } from 'node:fs/promises'
 /**
  * Host half of the restart-handoff bundle.
  *
@@ -1172,6 +1173,212 @@ async function staleByLogMtime(sessionId, cwd, now, maxAgeMs) {
   return { stale: false, mtime: undefined }
 }
 
+/** Zstandard frame magic, little-endian. */
+const ZSTD_MAGIC = 0xfd2fb528
+
+/** The same magic as bytes, for a substring scan over a raw window. */
+const ZSTD_MAGIC_BUFFER = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+
+/** How much of the file's tail one attempt reads before widening. */
+const TAIL_INITIAL_BYTES = 64 * 1024
+
+/** Consecutive widenings after which the tail read gives up and the log decides. */
+const TAIL_MAX_WIDENINGS = 12
+
+/**
+ * The log path of a session, in the persistence layer's own layout.
+ * @param {string} sessionId - the session id.
+ * @param {string | undefined} cwd - the session's recorded working directory.
+ * @returns {string[]} candidate log paths, compressed first.
+ */
+function sessionLogPaths(sessionId, cwd) {
+  const home = process.env.DSH_HOME ?? process.cwd()
+  const dir = pathJoin(pathJoin(home, 'sessions'), projectKey(cwd ?? ''), encodeSegment(sessionId))
+  return [pathJoin(dir, 'session.v4.jsonl.zstd'), pathJoin(dir, 'session.v4.jsonl')]
+}
+
+/**
+ * Offsets of every Zstandard frame in `buf`, from the frame headers.
+ *
+ * Only the header is parsed — the frame's content size field and its block
+ * headers give the frame length, so no frame is decompressed to find the next
+ * one. A trailing partial frame (a torn write) is simply not reported, which is
+ * what makes a truncated log fall back instead of guessing.
+ * @param {Buffer} buf - a byte window expected to start on a frame boundary.
+ * @returns {number[]} the offset of each complete frame.
+ */
+function frameOffsets(buf) {
+  const starts = []
+  let off = 0
+  while (off + 4 <= buf.length) {
+    if (buf.readUInt32LE(off) !== ZSTD_MAGIC) break
+    const fhd = buf[off + 4]
+    const fcsFlag = (fhd >> 6) & 0x3
+    const singleSegment = (fhd >> 5) & 1
+    const hasChecksum = (fhd >> 2) & 1
+    const dictIdFlag = fhd & 0x3
+    let p = off + 5
+    if (!singleSegment) p += 1
+    p += [0, 1, 2, 4][dictIdFlag]
+    p += [singleSegment ? 1 : 0, 2, 4, 8][fcsFlag]
+    let q = p
+    for (;;) {
+      if (q + 3 > buf.length) { q = -1; break }
+      const bh = buf[q] | (buf[q + 1] << 8) | (buf[q + 2] << 16)
+      const lastBlock = bh & 1
+      const blockType = (bh >> 1) & 0x3
+      const blockSize = (bh >> 3) & 0x1ffff
+      q += 3
+      q += blockType === 1 ? 1 : blockSize
+      if (lastBlock === 1) break
+    }
+    if (q < 0 || q <= off) break
+    if (hasChecksum) q += 4
+    starts.push(off)
+    off = q
+  }
+  return starts
+}
+
+/**
+ * The verdict on a LOG TAIL: was the session's LAST turn cut off?
+ *
+ * The log decides the same question the durable criterion does, but it answers
+ * it from the final turn boundary instead of from whole-file counts. That is
+ * exactly what a session's own tail can supply, so the scan can read a few
+ * kilobytes instead of decompressing a 20k-event log.
+ *
+ * The rule, over the events of the window:
+ *  - no turn at all (a seed-only or empty log) → nothing was in flight;
+ *  - a `turn/start` with no `turn/end` after it, or a last `turn/end` for an
+ *    EARLIER turn than the last `turn/start` → the tail turn never closed;
+ *  - last `turn/end` reason `interrupted`, or `aborted` + `disposed` → the
+ *    session layer / the process closed an orphaned turn;
+ *  - otherwise → the turn reported its own reason and nothing was in flight.
+ * @param {object[]} events - the window's events, in log order.
+ * @returns {{ cutOff: boolean, reason: string }} the verdict and its cause.
+ */
+function tailCutOffReason(events) {
+  const list = Array.isArray(events) ? events : []
+  let lastStart
+  let lastEnd
+  for (const event of list) {
+    if (event?.type === 'turn/start') lastStart = event
+    else if (event?.type === 'turn/end') lastEnd = event
+  }
+  if (lastStart === undefined && lastEnd === undefined) return { cutOff: false, reason: 'no-turn-end' }
+  if (lastStart !== undefined && lastEnd === undefined) return { cutOff: true, reason: 'unclosed-turn' }
+  const startTurn = lastStart?.data?.turn
+  const endTurn = lastEnd?.data?.turn
+  if (startTurn !== undefined && startTurn > endTurn) return { cutOff: true, reason: 'unclosed-turn' }
+  const endReason = lastEnd?.data?.reason
+  if (endReason?.kind === 'interrupted') return { cutOff: true, reason: 'interrupted' }
+  if (endReason?.kind === 'aborted' && endReason.reason?.kind === 'disposed') {
+    return { cutOff: true, reason: 'aborted+disposed' }
+  }
+  return { cutOff: false, reason: endReason?.kind === undefined ? 'no-turn-end' : String(endReason.kind) }
+}
+
+/**
+ * Whether a window ends at a point that can be judged: it holds a `turn/end`,
+ * or it holds the whole log.
+ *
+ * A tail window cut in the MIDDLE of a turn has neither a `turn/end` nor the
+ * file's start. Judging it would call a perfectly finished session "unclosed",
+ * so the caller widens instead. A fresh session that genuinely has an open turn
+ * reaches the start of the file with a `turn/start` in hand — that window IS
+ * judgeable, and `tailCutOffReason` reports the unclosed turn.
+ * @param {object[]} events - the window's events.
+ * @param {boolean} reachedStart - whether the window begins at the file start.
+ * @returns {boolean} true when the window can decide on its own.
+ */
+function tailWindowComplete(events, reachedStart) {
+  if (reachedStart) return true
+  // A window can decide as soon as its LAST turn boundary is known — that is,
+  // as soon as it contains a turn boundary at all. Whatever the newest one is:
+  //  - a `turn/end` — the last turn closed, and its reason is the verdict;
+  //  - a `turn/start` newer than every `turn/end` in the window — the last turn
+  //    is still open, which IS the verdict.
+  // No widening is needed for either case: the newest boundary in the window is
+  // the newest boundary in the file, because the window runs to EOF. A window
+  // with NO boundary at all is the only one that must widen.
+  const list = Array.isArray(events) ? events : []
+  return list.some(event => event?.type === 'turn/start' || event?.type === 'turn/end')
+}
+
+/**
+ * Read a log's TAIL and, when the tail can answer, the cut-off verdict.
+ *
+ * Walks backward in byte windows: read the last chunk, find the frames in it,
+ * decompress those frames, and stop as soon as the window holds a complete last
+ * turn. Each widening doubles the window, so a normally-terminated session
+ * costs one small read and a long turn costs a handful — never more than the
+ * whole file, which is what `gaveUp` reports.
+ * @param {string[]} paths - candidate log paths, compressed first.
+ * @param {number} logSize - the file size, for the first window.
+ * @returns {Promise<{ ok: boolean, events?: object[], reason?: string }>}
+ *   `ok: false` means the tail could not decide and the caller must fall back.
+ */
+async function readLogTail(paths, logSize) {
+  for (const file of paths) {
+    let handle
+    try {
+      handle = await fsOpen(file, 'r')
+    } catch {
+      continue
+    }
+    try {
+      let windowBytes = Math.min(TAIL_INITIAL_BYTES, logSize)
+      for (let attempt = 0; attempt <= TAIL_MAX_WIDENINGS; attempt += 1) {
+        if (windowBytes <= 0) return { ok: false, reason: 'empty' }
+        const start = Math.max(0, logSize - windowBytes)
+        const length = logSize - start
+        const buf = Buffer.alloc(length)
+        const { bytesRead } = await handle.read(buf, 0, length, start)
+        const raw = buf.subarray(0, bytesRead)
+        // A window that does not begin on a frame boundary opens IN THE MIDDLE
+        // of a frame, so the first bytes are not a frame header. Scan for the
+        // first magic and start there: everything before it is the tail of a
+        // frame whose head is outside the window, and it cannot be decompressed
+        // on its own.
+        const firstMagic = raw.indexOf(ZSTD_MAGIC_BUFFER)
+        const window = firstMagic === -1 ? Buffer.alloc(0) : raw.subarray(firstMagic)
+        const offsets = frameOffsets(window)
+        const events = []
+        for (let index = 0; index < offsets.length; index += 1) {
+          const from = offsets[index]
+          const to = index + 1 < offsets.length ? offsets[index + 1] : window.length
+          let text
+          try {
+            text = zstdDecompressSync(window.subarray(from, to)).toString('utf8')
+          } catch {
+            // A frame that will not decompress is a torn or corrupt write: the
+            // tail cannot be trusted, so the caller falls back to the log.
+            return { ok: false, reason: 'corrupt-tail' }
+          }
+          for (const line of text.split('\n')) {
+            if (line === '') continue
+            let parsed
+            try { parsed = JSON.parse(line) } catch { continue }
+            if (parsed?.type === 'session') continue
+            events.push(parsed)
+          }
+        }
+        const reachedStart = start === 0
+        if (events.length > 0 && tailWindowComplete(events, reachedStart)) {
+          return { ok: true, events }
+        }
+        if (reachedStart) return { ok: true, events }
+        windowBytes *= 2
+      }
+      return { ok: false, reason: 'window-too-small' }
+    } finally {
+      await handle.close().catch(() => {})
+    }
+  }
+  return { ok: false, reason: 'no-log-file' }
+}
+
 /**
  * How many session logs the scan reads at once.
  *
@@ -1307,7 +1514,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       console.error(`[restart-handoff] scan: ${id} skipped (older than the window, by mtime)`)
       continue
     }
-    pendingReads.push(id)
+    pendingReads.push({ id, cwd: record?.header?.cwd })
   }
   // Phase 2 — read those logs a few at a time. A read is pure, so overlapping
   // them cannot change a verdict; `mapBounded` hands back one outcome per id in
@@ -1315,17 +1522,46 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
   // are concurrent — resuming, waking and the `maxSessions` cap all stay in the
   // serial loop below, because they have side effects and an order.
   const readStartedAt = Date.now()
-  const readOutcomes = await mapBounded(pendingReads, SESSION_READ_CONCURRENCY, async (id) => {
-    const snapshot = await query.readSession(id)
-    return Array.isArray(snapshot?.events) ? snapshot.events : []
+  const readOutcomes = await mapBounded(pendingReads, SESSION_READ_CONCURRENCY, async (item) => {
+    // The TAIL decides first: the question is whether the session's LAST turn
+    // was cut off, and a few kilobytes at the end of the log answer it without
+    // decompressing the rest. `readSession` remains the fallback — it is the
+    // authority when the tail cannot be trusted (a single-frame file, a torn
+    // write, a corrupt frame, a missing log), and it is also what the durable
+    // criterion is defined on.
+    const paths = sessionLogPaths(item.id, item.cwd)
+    let size
+    try {
+      size = (await fsStat(paths[0])).size
+    } catch {
+      size = undefined
+    }
+    if (size !== undefined) {
+      const tail = await readLogTail([paths[0]], size)
+      if (tail.ok === true) return { viaTail: true, events: tail.events }
+    }
+    const snapshot = await query.readSession(item.id)
+    return { viaTail: false, events: Array.isArray(snapshot?.events) ? snapshot.events : [] }
   })
   const eventsById = new Map()
+  const verdictsById = new Map()
+  let tailReads = 0
+  let fullReads = 0
   for (let index = 0; index < pendingReads.length; index += 1) {
-    const id = pendingReads[index]
+    const id = pendingReads[index].id
     const outcome = readOutcomes[index]
     readCount += 1
-    if (outcome?.ok === true) eventsById.set(id, outcome.value)
-    else {
+    if (outcome?.ok === true) {
+      eventsById.set(id, outcome.value.events)
+      if (outcome.value.viaTail === true) {
+        tailReads += 1
+        // A tail window is already the answer: `cutOffReason` over it would be
+        // the global rule applied to a fragment, so the tail's own rule decides.
+        verdictsById.set(id, tailCutOffReason(outcome.value.events))
+      } else {
+        fullReads += 1
+      }
+    } else {
       eventsById.set(id, undefined)
       console.error(`[restart-handoff] could not read the session ${id}:`, outcome?.error)
     }
@@ -1393,7 +1629,9 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       continue
     }
     const events = loaded
-    const cutOff = cutOffReason(events)
+    // A tail read already produced the verdict (its window is the answer); a
+    // full read goes through the durable whole-log rule, unchanged.
+    const cutOff = verdictsById.get(id) ?? cutOffReason(events)
     const wasCutOff = cutOff.cutOff
     // The inbox projection is the one thing the observation is still good
     // for: it is the durable record of accepted-but-unstarted work.
@@ -1447,7 +1685,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     recovered.push(id)
     console.error(`[restart-handoff] scan: ${id} restored (${cutOff.cutOff ? cutOff.reason : 'queued-work'}) woken=${woken.length} teammates=${wokenTeammates.length}`)
   }
-  console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length} skipped-live=${skipped.live} skipped-child=${skipped.child} skipped-replayed=${skipped.replayed} skipped-noId=${skipped.noId} took=${Date.now() - scanStartedAt}ms reads=${readCount} readMs=${readMs}`)
+  console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length} skipped-live=${skipped.live} skipped-child=${skipped.child} skipped-replayed=${skipped.replayed} skipped-noId=${skipped.noId} skipped-prefiltered=${skipped.prefiltered} skipped-archived=${skipped.archived} took=${Date.now() - scanStartedAt}ms reads=${readCount} tailReads=${tailReads} fullReads=${fullReads} readMs=${readMs}`)
   return recovered
 }
 
@@ -1812,7 +2050,11 @@ export const internals = {
   runHandoff,
   selfKillSegments,
   SESSION_READ_CONCURRENCY,
+  readLogTail,
+  sessionLogPaths,
   staleByLogMtime,
+  tailCutOffReason,
+  tailWindowComplete,
   stillQueued,
   mapBounded,
   teamMemberIds,
