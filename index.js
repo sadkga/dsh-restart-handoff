@@ -636,16 +636,28 @@ async function wakeSubagents(ctx, sessionId, record) {
   // Team's own wording. Waking it here as well would tell the same child to
   // continue twice, once queued and once steered.
   const teamMembers = await teamMemberIds(ctx, ctx.get('agents')?.get?.(sessionId))
-  const continuable = descendants
-    .filter(child => child.mode === 'continuable' && !teamMembers.has(child.id))
-    .sort((left, right) => left.depth - right.depth)
+  // WHO to wake is decided by the child's own log, never by its mode: a
+  // one-shot child that was cut off mid-turn has work in flight just like a
+  // continuable one, and a child that finished must not be woken at all.
+  const candidates = descendants
+    .filter(child => typeof child?.id === 'string' && child.id !== '' && !teamMembers.has(child.id))
+    .sort((left, right) => (left.depth ?? 0) - (right.depth ?? 0))
   const woken = []
-  for (const child of continuable) {
+  for (const child of candidates) {
+    const cutOff = await wasSessionCutOff(ctx, child.id)
+    if (!cutOff.cutOff) {
+      console.error(`[restart-handoff] subagent ${child.id} left asleep (${cutOff.reason}, mode=${child.mode})`)
+      continue
+    }
     try {
       await subagents.prompt({
         requestId: randomUUID(),
         parentSessionId: child.parentId,
         childSessionId: child.id,
+        // The runtime's delivery protocol is continuable-addressed: `mode` is
+        // the address discriminator, not the child's creation mode. A one-shot
+        // child has no continuation state and its cold resume is refused by
+        // the runtime itself, which is reported as a skipped wake below.
         mode: 'continuable',
         delivery: 'queue',
         content: [{
@@ -654,8 +666,11 @@ async function wakeSubagents(ctx, sessionId, record) {
         }],
       }, AbortSignal.timeout(30_000))
       woken.push(child.id)
+      console.error(`[restart-handoff] subagent ${child.id} WOKEN (${cutOff.reason}, mode=${child.mode}, depth=${child.depth})`)
     } catch (error) {
-      console.error(`[restart-handoff] could not wake subagent ${child.id}:`, error)
+      // One child that cannot be woken must never cost the others.
+      const code = error instanceof Error && typeof error.code === 'string' ? ` ${error.code}` : ''
+      console.error(`[restart-handoff] subagent ${child.id} NOT WOKEN (${cutOff.reason}, mode=${child.mode})${code}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   return woken

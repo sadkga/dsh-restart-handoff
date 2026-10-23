@@ -178,6 +178,14 @@ test('a teammate is woken once, by the Team path', async () => {
   const ctx = {
     get(name) {
       if (name === 'agents') return { get: () => ({ id: 's1' }) }
+      // The teammate is genuinely cut off, so the generic path has every
+      // reason to wake it: the ONLY thing that must keep it out is the Team
+      // roster filter, not a read that happened to fail.
+      if (name === 'sessionQuery') {
+        return {
+          readSession: async () => ({ events: [{ type: 'turn/start', data: { turn: 1 } }] }),
+        }
+      }
       if (name === 'subagents') {
         return {
           listDescendants: async () => [{ id: 'm1', mode: 'continuable', depth: 1, parentId: 's1', activity: 'running' }],
