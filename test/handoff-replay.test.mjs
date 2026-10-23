@@ -262,3 +262,50 @@ test('a session the handoff already resumed is not recovered twice', async () =>
   assert.deepEqual(recovered, [])
   assert.equal(calls.resumed.length, 0)
 })
+
+test('a non-Lead session costs NO Team reconcile poll', async () => {
+  // The recovery runs this for every live session. Polling the Team roster
+  // first and asking who the agent is afterwards cost up to 5s per session:
+  // measured, 20 live sessions never finished the scan within 60s.
+  let polls = 0
+  const ctx = {
+    get(name) {
+      if (name !== 'agentTeams') return undefined
+      return {
+        tryMembership: () => ({ role: 'teammate' }),
+        listMembers: () => { polls += 1; return [{ role: 'teammate', status: 'provisioning', name: 't' }] },
+        sendMessage: async () => {},
+      }
+    },
+  }
+  const { wakeTeamMembers } = internals
+  const woken = await wakeTeamMembers(ctx, { id: 'not-a-lead' }, { reason: 'because' })
+  assert.deepEqual(woken, [])
+  assert.equal(polls, 0, 'a session that is not a Lead must not poll the roster at all')
+})
+
+test('a Lead with no surface roster still wakes its teammates', async () => {
+  const sent = []
+  let polls = 0
+  const ctx = {
+    get(name) {
+      if (name !== 'agentTeams') return undefined
+      return {
+        tryMembership: () => ({ role: 'lead' }),
+        listMembers: () => { polls += 1; return [{ role: 'teammate', status: 'inactive', name: 'tm1' }] },
+        sendMessage: async (_lead, request) => { sent.push(request.target) },
+      }
+    },
+  }
+  const { wakeTeamMembers } = internals
+  const woken = await wakeTeamMembers(ctx, { id: 'lead' }, { reason: 'because' })
+  assert.deepEqual(woken, ['tm1'])
+  assert.equal(polls, 1)
+  assert.deepEqual(sent, ['tm1'])
+})
+
+test('wakeTeamMembers survives a missing lead handle', async () => {
+  const ctx = { get: (name) => name === 'agentTeams' ? { tryMembership: () => ({ role: 'lead' }), listMembers: () => [] } : undefined }
+  const { wakeTeamMembers } = internals
+  assert.deepEqual(await wakeTeamMembers(ctx, undefined, { reason: 'because' }), [])
+})

@@ -765,7 +765,18 @@ async function teamMemberIds(ctx, agent) {
  */
 async function wakeTeamMembers(ctx, lead, record) {
   const teams = ctx.get('agentTeams')
-  if (teams === undefined) return []
+  if (teams === undefined || lead === undefined || lead === null) return []
+  // Decide membership BEFORE polling. A session that is not a Lead has no
+  // roster, and the reconcile poll below costs up to 5s; paying that for every
+  // live session turned the recovery into a multi-minute stall (measured: 20
+  // live sessions never finished the scan within 60s).
+  let membership
+  try {
+    membership = teams.tryMembership?.(lead)
+  } catch {
+    return []
+  }
+  if (membership?.role !== 'lead') return []
   let members = []
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
