@@ -605,11 +605,21 @@ async function waitForToolProviders(ctx, budgetMs) {
   const count = () => {
     const providers = prompt?.toolProviders
     if (providers === undefined) return undefined
-    return typeof providers.size === 'number' ? providers.size : undefined
+    // The registry is an AnonymousEntries: it has `values()` and `isEmpty()`,
+    // but no `size` — reading `size` yields undefined and the wait would never
+    // see the set change. Counting the values is the only way to read it.
+    if (typeof providers.values === 'function') {
+      let total = 0
+      for (const _ of providers.values()) total += 1
+      return total
+    }
+    if (typeof providers.isEmpty === 'function') return providers.isEmpty() ? 0 : 1
+    return undefined
   }
   if (count() === undefined) {
     // The Host does not publish the registry here; a flat wait is the best
     // that can be done, and it says so rather than pretending it settled.
+    console.error(`[restart-handoff] no tool registry is visible (systemPrompt=${prompt === undefined ? 'absent' : 'present'})`)
     await new Promise(resolve => { setTimeout(resolve, Math.max(0, budgetMs)) })
     return { settled: false, providers: 0, waitedMs: Date.now() - startedAt }
   }

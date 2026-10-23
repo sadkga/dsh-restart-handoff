@@ -18,7 +18,14 @@ test('the recovery waits for the tool providers to stop changing', async () => {
   const ctx = {
     get(name) {
       if (name !== 'systemPrompt') return undefined
-      return { toolProviders: { get size() { return size } } }
+      // The real registry is an AnonymousEntries: `values()` and `isEmpty()`,
+      // no `size`.
+      return {
+        toolProviders: {
+          values: function* () { for (let i = 0; i < size; i += 1) yield { i } },
+          isEmpty: () => size === 0,
+        },
+      }
     },
   }
 
@@ -48,7 +55,12 @@ test('a registry that never changes is not waited out', async () => {
   const ctx = {
     get(name) {
       if (name !== 'systemPrompt') return undefined
-      return { toolProviders: { size: 7 } }
+      return {
+        toolProviders: {
+          values: function* () { for (let i = 0; i < 7; i += 1) yield { i } },
+          isEmpty: () => false,
+        },
+      }
     },
   }
   const startedAt = Date.now()
