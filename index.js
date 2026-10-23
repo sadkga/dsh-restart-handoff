@@ -640,14 +640,21 @@ async function runHandoff(ctx, settings) {
     resumed.push({ agent, kind: entry.kind === 'peer' ? 'peer' : 'initiator' })
     console.error(`[restart-handoff] session ${sessionId} resumed as ${entry.kind}`)
 
+    let woken = []
     if (record.resumeSubagents === true) {
-      await wakeSubagents(ctx, sessionId, record)
+      woken = await wakeSubagents(ctx, sessionId, record)
     }
 
     const text = entry.kind === 'peer'
       ? `${intro} Your session was resumed and the other running sessions were resumed too. Continue the work you had in flight.`
       : `${intro} Continue the work below.\n\n${record.continuePrompt}`
     agent.followup(userMessage(text))
+    // The fate of one planned session, on its own line: it was resumed, and
+    // this is how many of its subagents were woken. A restored parent whose
+    // count is 0 was resumed for its own in-flight work (or as the durable
+    // parent of a child that could not be woken — that case is logged as
+    // NOT WOKEN above).
+    console.error(`[restart-handoff] plan: ${sessionId} RESTORED+WOKEN woken=${woken.length}`)
   }
 
   for (const entry of resumed) {
