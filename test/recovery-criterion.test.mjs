@@ -303,3 +303,84 @@ test('criterion: an old interrupted session is left alone', async () => {
   assert.deepEqual(recovered, [])
   assert.equal(calls.resumed.length, 0)
 })
+
+test('criterion: a corpus of finished sessions restores NOTHING', async () => {
+  // The regression that must never come back: an archive view that is not
+  // available must not degrade into "resume everything". Measured on the
+  // live store this list is 51 root sessions; only a genuinely cut-off one
+  // may come back.
+  const observations = [
+    observation('finished-a', { kind: 'completed' }),
+    observation('finished-b', { kind: 'error', error: { message: 'boom' } }),
+    observation('stopped-by-user', { kind: 'aborted', reason: { kind: 'user' } }),
+    observation('ceiling', { kind: 'max-tokens' }),
+    observation('cut-off', { kind: 'interrupted' }),
+  ]
+  const { ctx, calls } = scanCtx(observations)
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, ['cut-off'])
+  assert.equal(calls.resumed.length, 1)
+})
+
+test('criterion: an unclosed turn is recovered on the durable log alone', async () => {
+  // No turn/end at all: the writer never closed the turn. The recovery must
+  // not need the Host to have balanced the log first.
+  const { ctx, calls } = scanCtx([{
+    id: 'open-tail',
+    observation: {
+      events: [
+        { type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } },
+        { type: 'tool/call', seq: 1, time: Date.now(), data: { turn: 1, step: 1, callId: 'c1', name: 'read' } },
+      ],
+      projections: { values: {} },
+    },
+  }])
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, ['open-tail'])
+  assert.equal(calls.resumed.length, 1)
+})
+
+test('criterion: a seed-only view is not mistaken for a finished session', async () => {
+  // observeSession returns a seed view; the judgement must come from
+  // readSession, which the double serves separately. Here the observation is
+  // empty on purpose, and the complete log still shows the cut-off.
+  const { ctx, calls } = scanCtx([{
+    id: 'seed',
+    observation: {
+      events: [{ type: 'session/end-seed' }],
+      projections: { values: {} },
+    },
+  }])
+  const read = []
+  const realGet = ctx.get
+  ctx.get = (name) => {
+    const service = realGet(name)
+    if (name !== 'sessionQuery') return service
+    return {
+      ...service,
+      readSession: async (id) => {
+        read.push(id)
+        return { events: [{ type: 'turn/start', time: Date.now(), data: { turn: 1 } }] }
+      },
+    }
+  }
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, ['seed'])
+  assert.deepEqual(read, ['seed'])
+  assert.equal(calls.resumed.length, 1)
+})
+
+test('criterion: an archived session is not restored by the scan either', async () => {
+  // Archiving is a user decision, and the Host gates every step of an
+  // archived session (archived-session-gate). Resuming one would create an
+  // agent that can never take a step — a phantom in the registry.
+  const { ctx, calls } = scanCtx([observation('archived-cut-off', { kind: 'interrupted' })])
+  const realGet = ctx.get
+  ctx.get = (name) => {
+    if (name === 'workspaceRegistry') return { get archivedSessionIds() { return ['archived-cut-off'] } }
+    return realGet(name)
+  }
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, [])
+  assert.equal(calls.resumed.length, 0)
+})

@@ -944,6 +944,14 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
   const recovered = []
   const maxAgeMs = Number(settings.recoverMaxAgeMs ?? DEFAULTS.recoverMaxAgeMs)
   const maxSessions = Number(settings.recoverMaxSessions ?? DEFAULTS.recoverMaxSessions)
+  // Archiving is a user decision and the Host gates every step of an archived
+  // session, so resuming one would create an agent that can never take a
+  // step. When the archive set is unknown the scan keeps its strict criteria
+  // and says so — it must never degrade into "every session".
+  const archived = archivedIds(ctx)
+  if (archived === undefined) {
+    console.error('[restart-handoff] scan: no workspace view available, using the durable criterion alone')
+  }
   // Newest first: the cap must keep the sessions the user actually has open.
   records = [...records].sort((a, b) => (b?.header?.createdAt ?? 0) - (a?.header?.createdAt ?? 0))
   for (const record of records) {
@@ -952,6 +960,10 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     if (record?.header?.parentSession !== undefined) continue
     if (record?.live === true) continue
     if (alreadyResumed.includes(id)) continue
+    if (archived?.has(id)) {
+      console.error(`[restart-handoff] scan: ${id} skipped (archived)`)
+      continue
+    }
     // The log is read with `readSession`, not `observeSession`: the latter
     // returns a SEED view (a few events ending in `session/end-seed`), so a
     // judgement built on it inspects the wrong conversation. The cause is
@@ -987,7 +999,11 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       continue
     }
     if (!wasCutOff && !queued) {
-      console.error(`[restart-handoff] scan: ${id} skipped (finished: ${cutOff.reason})`)
+      // "finished" and "empty" are different facts and are logged apart: a
+      // seed-only log says nothing either way, and calling it finished would
+      // read like a judgement that was never made.
+      const verdict = cutOff.reason === 'no-turn-end' ? 'no turn to judge' : `finished: ${cutOff.reason}`
+      console.error(`[restart-handoff] scan: ${id} skipped (${verdict})`)
       continue
     }
     if (recovered.length >= maxSessions) break
