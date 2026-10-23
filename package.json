@@ -1,6 +1,6 @@
 {
   "name": "dsh-restart-handoff",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "./index.js",
   "description": "Restart the Harness itself and come back: a dedicated restart_dsh tool hands the session over to the next process, which resumes it, replays the pending instruction and wakes the subagents again.",
@@ -25,8 +25,12 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "docs",
     "test"
   ],
+  "engines": {
+    "node": ">=24.0"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

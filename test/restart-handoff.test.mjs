@@ -426,3 +426,87 @@ test('a record is written atomically, leaving no temporary file behind', async (
   assert.deepEqual(entries, [HANDOFF_FILE])
   await rm(dir, { recursive: true, force: true })
 })
+
+// ---------------------------------------------------------------------------
+// The exit itself.
+// ---------------------------------------------------------------------------
+
+test('the restart waits for the turn to go idle, then signals this process', async () => {
+  const { dir, settings } = await fixture()
+  const originalKill = process.kill
+  const signals = []
+  process.kill = (pid, signal) => { signals.push({ pid, signal }) }
+  try {
+    const listeners = []
+    const roots = [fakeAgent('s1')]
+    const ctx = {
+      ...fakeCtx({ roots }),
+      on: (name, listener) => { listeners.push({ name, listener }); return () => {} },
+    }
+    const tool = createRestartTool(ctx, { ...settings, dryRun: false })
+    const warned = await tool.execute({ reason: 'why', continuePrompt: 'plan' }, { agent: fakeAgent('s1') })
+    const result = await tool.execute({ reason: 'why', continuePrompt: 'plan', confirmToken: warned.confirmToken }, { agent: fakeAgent('s1') })
+    assert.equal(result.scheduled, true)
+    assert.equal(signals.length, 0, 'the process must not be signalled while the turn still runs')
+
+    for (const { name, listener } of listeners) {
+      if (name === 'agent/status') listener({ agent: { id: 's1' }, status: 'idle' })
+    }
+    await new Promise(resolve => { setTimeout(resolve, 20) })
+    assert.equal(signals.length, 1)
+    assert.equal(signals[0].pid, process.pid)
+    assert.equal(signals[0].signal, 'SIGTERM')
+  } finally {
+    process.kill = originalKill
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('the session list is re-sampled at the moment of the exit', async () => {
+  const { dir, settings } = await fixture()
+  const originalKill = process.kill
+  process.kill = () => {}
+  try {
+    const listeners = []
+    const late = fakeAgent('s2')
+    const roots = [fakeAgent('s1'), late]
+    const ctx = {
+      ...fakeCtx({ roots }),
+      on: (name, listener) => { listeners.push({ name, listener }); return () => {} },
+    }
+    const tool = createRestartTool(ctx, { ...settings, dryRun: false })
+    const warned = await tool.execute({ reason: 'why', continuePrompt: 'plan' }, { agent: fakeAgent('s1') })
+    assert.deepEqual(warned.sessions, ['s1'], 's2 was idle, so the warning does not list it')
+    await tool.execute({ reason: 'why', continuePrompt: 'plan', confirmToken: warned.confirmToken }, { agent: fakeAgent('s1') })
+
+    // s2 starts working while the model is still talking.
+    late.status = 'running'
+    for (const { name, listener } of listeners) {
+      if (name === 'agent/status') listener({ agent: { id: 's1' }, status: 'idle' })
+    }
+    await new Promise(resolve => { setTimeout(resolve, 20) })
+    const handoff = await readRecord(settings, HANDOFF_FILE)
+    assert.deepEqual(handoff.sessions, [{ id: 's1', kind: 'initiator' }, { id: 's2', kind: 'peer' }])
+  } finally {
+    process.kill = originalKill
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dry run writes the record but never signals the process', async () => {
+  const { dir, settings } = await fixture()
+  const originalKill = process.kill
+  const signals = []
+  process.kill = (pid, signal) => { signals.push({ pid, signal }) }
+  try {
+    const tool = createRestartTool(fakeCtx({ roots: [fakeAgent('s1')] }), { ...settings, dryRun: true })
+    const warned = await tool.execute({ reason: 'why', continuePrompt: 'plan' }, { agent: fakeAgent('s1') })
+    const result = await tool.execute({ reason: 'why', continuePrompt: 'plan', confirmToken: warned.confirmToken }, { agent: fakeAgent('s1') })
+    assert.equal(result.scheduled, false)
+    assert.equal(signals.length, 0)
+    assert.notEqual(await readRecord(settings, HANDOFF_FILE), undefined)
+  } finally {
+    process.kill = originalKill
+    await rm(dir, { recursive: true, force: true })
+  }
+})

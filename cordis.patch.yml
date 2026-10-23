@@ -6,3 +6,7 @@
         autoResume: true
         resumeSubagents: true
         idleTimeoutMs: 30000
+        # Recover the sessions an unplanned exit left behind.
+        recoverInterruptedSessions: true
+        recoverMaxAgeMs: 7200000
+        recoverMaxSessions: 50
