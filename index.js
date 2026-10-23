@@ -1135,6 +1135,7 @@ function createRestartTool(ctx, settings) {
             `The instruction the fresh process will replay: ${continuePrompt}`,
             `Sessions that will be resumed: ${sessions.length > 0 ? sessions.join(', ') : 'none'}`,
             'Call restart_dsh again with confirmToken to perform exactly this restart.',
+            `confirmToken: ${token}`,
           ].join('\n'),
           confirmToken: token,
           reason,
