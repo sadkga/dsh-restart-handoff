@@ -421,6 +421,32 @@ function isRootSession(ctx, sessionId) {
  * @param {object} root - the root agent.
  * @returns {Promise<boolean>} true when the session must come back.
  */
+/**
+ * The registry-global archive set, when the profile publishes the workspace
+ * registry to this plugin context.
+ *
+ * The registry is a Service registered as `workspaceRegistry` and exposes
+ * `archivedSessionIds` as a getter. It is reached through `ctx.get` like every
+ * other service, because a direct property access throws when it is absent.
+ * A profile without it returns `undefined`, and the caller must then say so in
+ * its log instead of silently treating "no archive data" as "nothing is
+ * archived".
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @returns {Set<string> | undefined} the archived ids, or undefined when unseen.
+ */
+function archivedIds(ctx) {
+  const registry = ctx.get('workspaceRegistry')
+  if (registry === undefined) return undefined
+  try {
+    const ids = registry.archivedSessionIds
+    if (ids === undefined || ids === null) return undefined
+    return new Set(Array.from(ids, id => String(id)))
+  } catch (error) {
+    console.error('[restart-handoff] could not read the archived session ids:', error)
+    return undefined
+  }
+}
+
 async function isResumableRoot(ctx, root) {
   if (root?.status === 'running') return true
   if (hasPendingWork(root)) return true
@@ -459,13 +485,35 @@ async function listResumableSessions(ctx, callerId) {
  */
 async function collectRestartTargets(ctx, callerId, settings = {}) {
   const roots = ctx.get('agents')?.roots?.() ?? []
+  const archived = archivedIds(ctx)
+  if (archived === undefined) {
+    console.error('[restart-handoff] collecting: no workspace view available, relying on the live registry alone')
+  }
   const ids = []
   for (const root of roots) {
     const id = root?.id
     if (typeof id !== 'string' || id === '') continue
-    if (id === callerId) { ids.push(id); continue }
+    if (id === callerId) {
+      // The caller is never dropped: it asked for the restart and must come
+      // back even if it happens to be archived (it cannot be, or its own
+      // step would have been gated — but the plan must not depend on that).
+      ids.push(id)
+      continue
+    }
     if (settings.resumeRunningSessions === false) continue
-    if (await isResumableRoot(ctx, root)) ids.push(id)
+    if (archived !== undefined && archived.has(id)) {
+      console.error(`[restart-handoff] collecting: ${id} skipped (archived)`)
+      continue
+    }
+    const busy = await isResumableRoot(ctx, root)
+    if (!busy) {
+      // Open but with nothing in flight: it is not a restart target. It stays
+      // on disk and the user can reopen it; resuming it would put a silent
+      // idle agent back into the registry.
+      console.error(`[restart-handoff] collecting: ${id} skipped (nothing in flight)`)
+      continue
+    }
+    ids.push(id)
   }
   return ids
 }
@@ -1259,10 +1307,13 @@ export const internals = {
   DEFAULTS,
   HANDOFF_FILE,
   PENDING_FILE,
+  archivedIds,
+  balanceLog,
   collectRestartTargets,
   collectStrings,
   createRestartGuard,
   createRestartTool,
+  cutOffReason,
   dangerousSegments,
   hasPendingWork,
   headVerb,
@@ -1282,6 +1333,7 @@ export const internals = {
   teamMemberIds,
   wakeSubagents,
   wakeTeamMembers,
+  wasSessionCutOff,
   writeRecord,
   clearRecord,
 }
