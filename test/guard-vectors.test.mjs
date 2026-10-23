@@ -445,3 +445,52 @@ test('boundary: an unknown plugin tool carries data, not commands', () => {
     undefined,
   )
 })
+
+// ---------------------------------------------------------------------------
+// H. The indirect self-kill: the pid never appears in the command text.
+//
+// The guard runs inside the Host, so it knows the Host's own command line. A
+// lookup whose pattern would select that command line is looking for the
+// Host, and a signal in the same command line is aimed at it — however
+// indirect the reference to the pid is.
+// ---------------------------------------------------------------------------
+
+// The probe process stands in for the Host here: its own command line is the
+// fingerprint a lookup would have to match.
+const HOST_MARK = process.argv[1].split('/').pop()
+const HOST_WORD = HOST_MARK.split('.')[0]
+
+test('vector: looking the Host up and then killing the result is denied', () => {
+  assertDenied(`P=$(pgrep -f "${HOST_MARK}" | head -1) && kill -TERM $P`)
+})
+
+test('vector: the same, with the pid in a command substitution, is denied', () => {
+  assertDenied(`kill $(pgrep -f "${HOST_MARK}")`)
+})
+
+test('vector: looking the Host up and killing it by name is denied', () => {
+  assertDenied(`pkill -f "${HOST_WORD}"`)
+})
+
+test('vector: killing the whole process group is denied', () => {
+  assertDenied('kill 0')
+})
+
+test('allowed: looking the Host up without signalling it is only a lookup', () => {
+  assert.equal(guard({ name: 'bash', arguments: { command: `pgrep -f "${HOST_MARK}"` } }), undefined)
+})
+
+test('allowed: looking another process up and killing it is ordinary work', () => {
+  assert.equal(
+    guard({ name: 'bash', arguments: { command: 'P=$(pgrep -f "my-unrelated-service" | head -1) && kill -TERM $P' } }),
+    undefined,
+  )
+})
+
+test('allowed: killing a process by its own pid is ordinary work', () => {
+  assert.equal(guard({ name: 'bash', arguments: { command: 'kill -9 12345' } }), undefined)
+})
+
+test('allowed: killing a process group other than the Host\'s own is ordinary work', () => {
+  assert.equal(guard({ name: 'bash', arguments: { command: 'kill -- -12345' } }), undefined)
+})

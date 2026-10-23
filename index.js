@@ -112,6 +112,14 @@ const TEXT_RESTART_PATTERNS = [
 /** Verbs that kill processes; what they aim at only matters inside them. */
 const KILL_VERBS = new Set(['kill', 'pkill', 'killall', 'killall5'])
 
+/**
+ * The verbs that LOOK a process up instead of signalling it.
+ *
+ * A lookup is harmless on its own. It matters when the pattern it searches
+ * for would select the Host, and a signal follows in the same command line.
+ */
+const PROCESS_LOOKUPS = new Set(['pgrep', 'pidof', 'ps', 'grep'])
+
 /** Verbs that are dangerous whatever they are aimed at. */
 const ALWAYS_DANGEROUS = new Set(['halt', 'init', 'telinit', 'reboot', 'shutdown', 'poweroff', 'taskkill', 'stop-process'])
 
@@ -336,9 +344,7 @@ function isCommandTool(name) {
  * Whether a segment kills THIS very process.
  *
  * The plugin runs inside the Host process, so `process.pid` IS the Host's pid.
- * That closes the most realistic suicide path, the two-step one: look the pid
- * up with a harmless `pgrep`, then kill it in the next command. A text guard
- * cannot read the process table, so the pid has to be matched literally.
+ * A literal pid is matched directly.
  * @param {string} segment - one segment of a command line.
  * @returns {boolean} true when the segment targets this very process.
  */
@@ -352,18 +358,159 @@ function killsSelf(segment) {
 }
 
 /**
+ * The Host's own command line, lower-cased.
+ *
+ * The guard runs inside the Host, so it knows what the Host looks like from
+ * the outside. A lookup that matches this line is looking for the Host.
+ * @returns {string} the Host's command line.
+ */
+function hostCommandLine() {
+  return [process.execPath, ...process.argv.slice(1)].join(' ').toLowerCase()
+}
+
+/**
+ * Whether a lookup pattern would select the Host.
+ *
+ * `pkill -f` and `grep -f` match against the full command line of every
+ * process, so a pattern that occurs in the Host's own command line selects
+ * the Host. This is the shell's own rule, not a guess: the guard asks what
+ * the command would match, and answers from the process table it lives in.
+ * @param {string} pattern - the pattern a lookup would use.
+ * @returns {boolean} true when the pattern selects the Host.
+ */
+function patternSelectsHost(pattern) {
+  const needle = String(pattern ?? '').trim().toLowerCase()
+  if (needle === '') return false
+  return hostCommandLine().includes(needle)
+}
+
+/**
+ * The pattern a lookup segment looks for.
+ * @param {string} segment - one segment of a command line.
+ * @returns {string | undefined} the pattern, when the segment carries one.
+ */
+function lookupPattern(segment) {
+  // `pgrep -f <pattern>` / `pidof -f <pattern>`
+  const full = segment.match(/(?:^|\s)-f\s+["']?([^"'\s]+)/)
+  if (full !== null) return full[1]
+  // `ps aux | grep <pattern>` — the grep that filters the listing
+  const grep = segment.match(/\bgrep\b(?:\s+-[a-zA-Z]+)*\s+["']?([^"'\s|]+)/)
+  if (grep !== null) return grep[1]
+  // `pgrep <name>` — the process name, matched against the executable name
+  const name = segment.match(/^(?:pgrep|pidof)\s+["']?([^"'\s]+)/)
+  if (name !== null) return name[1]
+  return undefined
+}
+
+/**
+ * The payloads a command substitution carries.
+ *
+ * A substitution is a command of its own: `P=$(pgrep -f "x" | head -1)` runs
+ * `pgrep`, and the shell only then assigns its output. Splitting the line at
+ * the separators leaves `P=$(pgrep -f "x"` as one piece, whose head verb is
+ * neither `pgrep` nor anything else — the command inside the substitution has
+ * to be looked at separately.
+ * @param {string} segment - one segment of a command line.
+ * @returns {string[]} the commands the substitutions run.
+ */
+function substitutionPayloads(segment) {
+  const payloads = []
+  const parens = /\$\(([^()]*)\)/g
+  let match = parens.exec(segment)
+  while (match !== null) {
+    payloads.push(match[1])
+    match = parens.exec(segment)
+  }
+  const ticks = /`([^`]*)`/g
+  match = ticks.exec(segment)
+  while (match !== null) {
+    payloads.push(match[1])
+    match = ticks.exec(segment)
+  }
+  return payloads
+}
+
+/**
+ * The lookups in a command line that would select the Host.
+ *
+ * A lookup is only interesting when its pattern selects the Host: looking up
+ * an unrelated process is ordinary work and must stay allowed.
+ * @param {string} command - the command text.
+ * @returns {string[]} the segments that look the Host up.
+ */
+function hostLookups(command) {
+  const found = []
+  // The substitutions are read from the WHOLE line: splitting at the
+  // separators cuts a `$( … )` in half, so the closing bracket lands in the
+  // next piece and the segment alone no longer holds a complete substitution.
+  const candidates = []
+  for (const raw of String(command).split(/[;&|\n]+/)) {
+    const segment = raw.trim()
+    if (segment !== '') candidates.push(segment)
+  }
+  for (const payload of substitutionPayloads(String(command))) {
+    const trimmed = payload.trim()
+    if (trimmed !== '') candidates.push(trimmed)
+  }
+  for (const candidate of candidates) {
+    const { word } = headVerb(candidate)
+    if (!PROCESS_LOOKUPS.has(word)) continue
+    const pattern = lookupPattern(candidate)
+    if (pattern !== undefined && patternSelectsHost(pattern)) found.push(candidate)
+  }
+  return found
+}
+
+/**
+ * Whether a kill segment would take down more than the one process it names.
+ *
+ * `kill -1` signals every process the caller may signal, and `kill 0` signals
+ * the caller's whole process group. The Host runs every agent in one process,
+ * so either one takes the sessions and their subagents down with it.
+ * @param {string} segment - one segment of a command line.
+ * @returns {boolean} true when the segment signals a group or everything.
+ */
+function targetsEveryone(segment) {
+  if (!/\b(kill|killall5?|pkill|taskkill)\b/i.test(segment)) return false
+  for (const token of segment.split(/\s+/).slice(1)) {
+    // `kill -9 12345` names one process and is left alone: `9` is a signal.
+    if (token === '-1' || token === '0') return true
+  }
+  return false
+}
+
+/**
+ * Whether a kill-by-name segment would select the Host.
+ * @param {string} segment - one segment of a command line.
+ * @returns {boolean} true when the name or pattern selects the Host.
+ */
+function killsHostByName(segment) {
+  const { word } = headVerb(segment)
+  if (word !== 'pkill' && word !== 'killall' && word !== 'killall5') return false
+  const pattern = lookupPattern(segment)
+  return pattern !== undefined && patternSelectsHost(pattern)
+}
+
+/**
  * The segments of a command line that kill THIS very process.
  * @param {string} command - the command text.
  * @returns {string[]} the self-killing segments.
  */
 function selfKillSegments(command) {
   const found = []
+  // A lookup that would select the Host, in the same command line as a
+  // signal, is a self-kill however indirect the reference is:
+  // `P=$(pgrep -f "bin.ts web") && kill $P` never puts the pid in the text.
+  const lookup = hostLookups(command)
   for (const raw of String(command).split(/[;&|\n]+/)) {
     const segment = raw.trim()
     if (segment === '') continue
     const { word } = headVerb(segment)
     if (!KILL_VERBS.has(word)) continue
-    if (killsSelf(segment)) found.push(segment)
+    if (killsSelf(segment)) { found.push(segment); continue }
+    if (targetsEveryone(segment)) { found.push(segment); continue }
+    if (killsHostByName(segment)) { found.push(segment); continue }
+    if (lookup.length > 0) { found.push(segment); continue }
   }
   return found
 }
