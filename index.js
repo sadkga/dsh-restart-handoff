@@ -614,8 +614,21 @@ async function waitForToolProviders(ctx, budgetMs) {
   }
   // The event is documented as part of the service's surface; a Host that
   // does not publish it simply leaves the wait to its budget.
-  const subscribed = typeof ctx.on === 'function'
-  if (subscribed) ctx.on('system-prompt/change', onChange)
+  //
+  // The subscription is NOT undone with `ctx.off`: that call needs an inject
+  // context and throws "cannot get property off without inject" — which is
+  // how one restart ended up doing no recovery at all. `ctx.on` returns a
+  // disposer, and the plugin's own fiber unsubscribes everything when the
+  // bundle is unloaded, so leaving the listener in place is both safe and
+  // correct.
+  let dispose = null
+  if (typeof ctx.on === 'function') {
+    try {
+      dispose = ctx.on('system-prompt/change', onChange)
+    } catch {
+      dispose = null
+    }
+  }
   try {
     while (Date.now() - startedAt < budgetMs) {
       await new Promise(resolve => { setTimeout(resolve, 150) })
@@ -624,7 +637,9 @@ async function waitForToolProviders(ctx, budgetMs) {
       }
     }
   } finally {
-    if (subscribed && typeof ctx.off === 'function') ctx.off('system-prompt/change', onChange)
+    if (typeof dispose === 'function') {
+      try { dispose() } catch { /* the fiber will drop it anyway */ }
+    }
   }
   return { settled: false, changes, waitedMs: Date.now() - startedAt }
 }
@@ -2329,11 +2344,21 @@ export function apply(ctx, config = {}) {
       // bundle's apply() returns. A session resumed before they are up is
       // handed a shorter tool list, and its transcript says so. Waiting for
       // the registry to settle costs a moment and removes the difference.
+      //
+      // The wait is a refinement, never a precondition: if it fails, the
+      // recovery still runs. A refinement that can throw must never stand
+      // between a restart and the sessions it is meant to bring back — that
+      // is how one restart ended up recovering nothing at all.
       void waitForToolProviders(ctx, Number(settings.resumeSettleMs ?? DEFAULTS.resumeSettleMs))
-        .then((settled) => {
-          console.error(`[restart-handoff] the prompt registry ${settled.settled ? 'settled' : 'did not settle'} after ${settled.waitedMs}ms (${settled.changes} change notifications)`)
-          return runHandoff(ctx, settings)
-        })
+        .then(
+          (settled) => {
+            console.error(`[restart-handoff] the prompt registry ${settled.settled ? 'settled' : 'did not settle'} after ${settled.waitedMs}ms (${settled.changes} change notifications)`)
+          },
+          (error) => {
+            console.error('[restart-handoff] could not wait for the prompt registry; recovering anyway:', error)
+          },
+        )
+        .then(() => runHandoff(ctx, settings))
         .then((handoff) => recoverUnplannedSessions(ctx, settings, handoff ?? []))
         .catch((error) => {
           console.error('[restart-handoff] handoff or unplanned recovery failed:', error)

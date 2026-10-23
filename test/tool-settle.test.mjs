@@ -71,3 +71,19 @@ test('a Host that announces nothing is waited out, and says so', async () => {
   assert.equal(observed.settled, false, 'without announcements nothing can be seen as settled')
   assert.ok(Date.now() - startedAt >= 250, 'the budget must still be waited out')
 })
+
+test('the wait never throws when the Host refuses to be unsubscribed', async () => {
+  // `ctx.off` needs an inject context and throws "cannot get property off
+  // without inject" — and that exception, thrown from the wait, took the
+  // whole recovery down with it: one restart resumed nothing at all. The
+  // wait must survive a Host that will not let it unsubscribe.
+  const ctx = {
+    get: () => undefined,
+    on() {
+      throw new Error('cannot get property "off" without inject')
+    },
+  }
+  const observed = await waitForToolProviders(ctx, 200)
+  assert.equal(observed.settled, false, 'a Host that refuses the subscription cannot be watched')
+  assert.ok(observed.waitedMs >= 150, 'the budget must still be waited out')
+})
