@@ -29,9 +29,6 @@ import { readFile as fsReadFile, writeFile as fsWriteFile, mkdir as fsMkdir, ren
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
 
 /** Plugin name the loader and the inventory show. */
 
@@ -78,6 +75,8 @@ const DEFAULTS = {
   recoverMaxAgeMs: 2 * 60 * 60 * 1000,
   /** How many interrupted sessions one start may recover. */
   recoverMaxSessions: 50,
+  /** Recover the sessions an unplanned exit left behind. */
+  recoverInterruptedSessions: true,
   /** Write the handoff record but never signal this process. */
   dryRun: false,
 }
@@ -138,6 +137,36 @@ const DANGEROUS_DETAILS = [
 
 /** Actions that make a service manager dangerous. */
 const SERVICE_ACTIONS = /\b(restart|stop|kill|reload|disable|halt)\b/i
+
+/**
+ * The reason a shell restart is denied.
+ *
+ * The denial has to name the way out, otherwise the model just tries the next
+ * spelling of the same suicide.
+ */
+const RESTART_DENIAL = 'Restarting the Harness through a shell command is blocked: the command would kill the running turn, the tool result and the session. Use the restart_dsh tool instead — it warns first, records the handoff and resumes every session after the restart.'
+
+/**
+ * Tools whose arguments are EXECUTED rather than stored.
+ *
+ * The scope matters: a `write`/`edit` payload that mentions
+ * `systemctl --user restart dsh.service` is documentation, not an execution,
+ * and denying it would stop the agent from writing its own tests and notes.
+ * A shell tool's command IS an execution, so that is what the command kernel
+ * judges. The name list is deliberately generous — a code-execution channel
+ * (`run_code`) kills the Host just as well as a shell does.
+ */
+const COMMAND_TOOL_NAMES = /(?:^|[^a-z0-9])(?:bash|pwsh|sh|zsh|ksh|shell|terminal|exec|execute|command|cmd|code)(?:[^a-z0-9]|$)/i
+
+/**
+ * The code-shaped subset of TEXT_RESTART_PATTERNS: the four patterns that
+ * cannot occur in prose.
+ *
+ * They are denied in EVERY tool, including the ones whose arguments are data
+ * rather than commands: a sentence never contains `process.kill(process.ppid,
+ * 15)`, so treating these as prose-mentions would only lose the defence.
+ */
+const SELF_HARM_PATTERNS = TEXT_RESTART_PATTERNS.slice(0, 4)
 
 /**
  * The command a segment runs, with the wrappers peeled off.
@@ -221,84 +250,170 @@ function collectStrings(value) {
  * It scans the arguments of EVERY tool, not only the shell ones: a tool that
  * can run code can also kill the Host, and the model's way in is not the point
  * — the restart has to go through the tool that records the handoff.
+ *
+ * Two scopes, one kernel. The command kernel (`headVerb` →
+ * `dangerousSegments`) judges a string only when it could be EXECUTED: the
+ * tool is a shell or a code runner. The code-shaped self-harm patterns are
+ * denied everywhere, because prose never contains them.
  * @returns {(execution: Readonly<{ name: string, arguments?: unknown }>) => string | undefined} the guard.
  */
 function createRestartGuard() {
   return (execution) => {
     if (execution?.name === 'restart_dsh') return undefined
+    const executes = isCommandTool(execution?.name)
     for (const text of collectStrings(execution?.arguments)) {
-      if (isSelfKill(text)) return RESTART_DENIAL
+      if (SELF_HARM_PATTERNS.some(pattern => pattern.test(text))) return RESTART_DENIAL
+      if (!executes) continue
       if (TEXT_RESTART_PATTERNS.some(pattern => pattern.test(text))) return RESTART_DENIAL
       if (dangerousSegments(text).length > 0) return RESTART_DENIAL
+      if (selfKillSegments(text).length > 0) return RESTART_DENIAL
+    }
     return undefined
   }
 }
 
-
+/**
+ * Whether a tool's arguments are executed rather than stored.
+ * @param {unknown} name - the tool name.
+ * @returns {boolean} true for shell-like and code-execution tools.
+ */
+function isCommandTool(name) {
+  return typeof name === 'string' && COMMAND_TOOL_NAMES.test(name)
 }
 
 
 
-function isSelfKill(command) {
-  for (const raw of splitSegments(String(command))) {
-    const segment = raw.trim()
-    if (segment === '') continue
-    const words = tokenize(segment)
-    if (words.length === 0) continue
-    const { word } = headVerb(words)
-    if (!KILL_VERBS.has(word)) continue
-    if (isHostPidIn(words)) return true
-    if (/\$\{?PPID\}?/i.test(segment)) return true
-  }
+/**
+ * Whether a segment kills THIS very process.
+ *
+ * The plugin runs inside the Host process, so `process.pid` IS the Host's pid.
+ * That closes the most realistic suicide path, the two-step one: look the pid
+ * up with a harmless `pgrep`, then kill it in the next command. A text guard
+ * cannot read the process table, so the pid has to be matched literally.
+ * @param {string} segment - one segment of a command line.
+ * @returns {boolean} true when the segment targets this very process.
+ */
+function killsSelf(segment) {
+  if (!/\b(kill|killall5?|pkill|taskkill)\b/i.test(segment)) return false
+  // `kill -9 31337`, `kill 31337`, `kill -TERM 31337`
+  if (new RegExp(`\\b${process.pid}\\b`).test(segment)) return true
+  // `kill $PPID` — the parent of the Host's child shell is the Host itself.
+  if (/\$\{?PPID\}?/.test(segment)) return true
   return false
 }
 
 /**
- * The command text a shell-like tool carries.
- * @param {unknown} args - the tool's arguments.
- * @returns {string | undefined} the command, when there is one.
+ * The segments of a command line that kill THIS very process.
+ * @param {string} command - the command text.
+ * @returns {string[]} the self-killing segments.
  */
-function commandOf(args) {
-  if (args === null || typeof args !== 'object') return undefined
-  const record = /** @type {Record<string, unknown>} */ (args)
-  for (const key of ['command', 'script', 'input', 'text', 'cmd']) {
-    const value = record[key]
-    if (typeof value === 'string') return value
+function selfKillSegments(command) {
+  const found = []
+  for (const raw of String(command).split(/[;&|\n]+/)) {
+    const segment = raw.trim()
+    if (segment === '') continue
+    const { word } = headVerb(segment)
+    if (!KILL_VERBS.has(word)) continue
+    if (killsSelf(segment)) found.push(segment)
   }
-  return undefined
+  return found
 }
 
 /**
- * Every string inside a tool's arguments.
- *
- * The arguments of a tool call are a losslessly JSON-serializable tree, so
- * walking it finds a command that was smuggled through any channel: a shell
- * tool's command, a `run_code` program, a plugin tool's own payload.
- * @param {unknown} value - the arguments.
- * @param {number} depth - how deep the walk already went.
- * @returns {string[]} the strings.
+ * The descendants of a session, when the profile has the delegation runtime.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {string} sessionId - the root session.
+ * @returns {Promise<object[]>} the descendants, empty when there are none.
  */
-function argumentStrings(value, depth = 0) {
-  if (depth > MAX_ARGUMENT_DEPTH) return []
-  if (typeof value === 'string') return [value]
-  if (Array.isArray(value)) {
-    const found = []
-    for (const item of value) {
-      if (found.length >= MAX_ARGUMENT_STRINGS) break
-      found.push(...argumentStrings(item, depth + 1))
-    }
-    return found
+async function listSubagents(ctx, sessionId) {
+  const subagents = ctx.get('subagents')
+  if (subagents === undefined) return []
+  try {
+    const descendants = await subagents.listDescendants(sessionId)
+    return Array.isArray(descendants) ? descendants : []
+  } catch (error) {
+    console.error('[restart-handoff] could not list the subagents:', error)
+    return []
   }
-  if (value !== null && typeof value === 'object') {
-    const found = []
-    const record = /** @type {Record<string, unknown>} */ (value)
-    for (const item of Object.values(record)) {
-      if (found.length >= MAX_ARGUMENT_STRINGS) break
-      found.push(...argumentStrings(item, depth + 1))
-    }
-    return found
+}
+
+/**
+ * Whether an agent has work queued that never started.
+ *
+ * A queued prompt is work in flight: it was accepted by the agent, so it is
+ * lost when the process dies unless the session comes back.
+ * @param {object | undefined} agent - the agent.
+ * @returns {boolean} true when a prompt is waiting for a turn or a step.
+ */
+function hasPendingWork(agent) {
+  return (agent?.inbox?.nextTurn?.length ?? 0) > 0 || (agent?.inbox?.nextStep?.length ?? 0) > 0
+}
+
+/**
+ * Whether a session is a top-level one.
+ *
+ * Only a root may restart the Harness: a subagent restarting it would take
+ * its own parent down with it, and the handoff would have no initiator to
+ * hand the instruction back to.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {string} sessionId - the session id.
+ * @returns {boolean} true for a top-level session.
+ */
+function isRootSession(ctx, sessionId) {
+  const roots = ctx.get('agents')?.roots?.() ?? []
+  return roots.some(root => root?.id === sessionId)
+}
+
+/**
+ * Whether a root session is worth resuming after a restart.
+ *
+ * Three ways to be worth it: it is running right now, it has a prompt queued
+ * that never started, or one of its subagents is alive.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {object} root - the root agent.
+ * @returns {Promise<boolean>} true when the session must come back.
+ */
+async function isResumableRoot(ctx, root) {
+  if (root?.status === 'running') return true
+  if (hasPendingWork(root)) return true
+  const descendants = await listSubagents(ctx, root?.id)
+  return descendants.some(child => child?.activity === 'running')
+}
+
+/**
+ * The sessions that must come back after a restart, without the caller.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {string} callerId - the session that asked for the restart.
+ * @returns {Promise<string[]>} the session ids.
+ */
+async function listResumableSessions(ctx, callerId) {
+  const roots = ctx.get('agents')?.roots?.() ?? []
+  const ids = []
+  for (const root of roots) {
+    const id = root?.id
+    if (typeof id !== 'string' || id === '') continue
+    if (id === callerId) continue
+    if (await isResumableRoot(ctx, root)) ids.push(id)
   }
-  return []
+  return ids
+}
+
+/**
+ * The sessions a restart must bring back: the caller plus every other
+ * session that is running, queued or has a live subagent.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {string} callerId - the session that asked for the restart.
+ * @returns {Promise<string[]>} the session ids, in registration order.
+ */
+async function collectRestartTargets(ctx, callerId) {
+  const roots = ctx.get('agents')?.roots?.() ?? []
+  const ids = []
+  for (const root of roots) {
+    const id = root?.id
+    if (typeof id !== 'string' || id === '') continue
+    if (id === callerId || await isResumableRoot(ctx, root)) ids.push(id)
+  }
+  return ids
 }
 
 
@@ -599,24 +714,260 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     }
     const ends = observation?.events?.filter(event => event.type === 'turn/end') ?? []
     const endReason = ends.at(-1)?.data?.reason
+    // The durable fingerprint is the last turn's ENDING. `interrupted` is the
+    // closer the session layer appends for a log whose tail turn never ended
+    // — both on resume and on a cold read, so this one judgement covers a
+    // session that was never resumed AND one that was. `aborted` with a
+    // `disposed` cause is the teardown path. A turn the human stopped
+    // (`aborted` + `user`), a turn that finished (`completed`) and a turn that
+    // failed (`error`) had nothing in flight and must stay dead.
     const wasCutOff = endReason?.kind === 'interrupted'
       || (endReason?.kind === 'aborted' && endReason.reason?.kind === 'disposed')
-    const openTurn = observation?.projections?.values?.turnBoundary?.openTurnStartSeq != null
-    const inboxState = observation?.projections?.values?.inbox
-    const queued = (inboxState?.['next-turn']?.length ?? 0) > 0 || (inboxState?.['next-step']?.length ?? 0) > 0
-    const cutOff = wasCutOff || openTurn || queued
     const lastEvent = observation?.events?.[observation.events.length - 1]
     if (typeof lastEvent?.time === 'number' && Date.now() - lastEvent.time > maxAgeMs) continue
+    if (!wasCutOff) continue
     if (recovered.length >= maxSessions) break
     const agent = await resumeSession(ctx, id)
     if (agent === undefined) continue
-    if (cutOff) agent.followup(userMessage('The Harness process went down unexpectedly and your session was resumed. Continue the work that was in flight.'))
-    if (cutOff) await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
+    agent.followup(userMessage('The Harness process went down unexpectedly and your session was resumed. Continue the work that was in flight.'))
+    await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
     recovered.push(id)
     console.error(`[restart-handoff] recovered the interrupted session ${id}`)
   }
   console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length}`)
   return recovered
+}
+
+/**
+ * The restart tool.
+ *
+ * Two steps, on purpose. The FIRST call only warns: it names what the restart
+ * would do, which sessions would come back and what the fresh process would
+ * replay, and it hands back a confirmation token. The SECOND call carries that
+ * token, and it executes THE PLAN IN THE WARNING — the reason and the
+ * instruction come from the pending record, never from the second call's
+ * arguments. A model that rewrites the plan between the two calls would be
+ * confirming a plan nobody ever saw, and the confirmation would mean nothing.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {Record<string, any>} settings - effective plugin settings.
+ * @returns {Record<string, any>} the tool definition.
+ */
+function createRestartTool(ctx, settings) {
+  // One restart per tool instance: the second confirmation must not schedule
+  // a second exit.
+  let exiting = false
+
+  return {
+    name: 'restart_dsh',
+    description: [
+      'Restart the DeepSeek Harness and come back with the work intact.',
+      'Call it TWICE: the first call only warns — it lists the sessions that would be resumed and the instruction the fresh process would replay — and returns a confirmation token; the second call passes that token back and performs the restart.',
+      'Never restart the Harness through a shell command: that kills the running turn, the tool result and the session.',
+      'The second call runs the plan from the FIRST call, so reason and continuePrompt are only read on the first one.',
+      'continuePrompt must be self-contained: it is handed to the resumed session after the restart, with no conversation context.',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        reason: { type: 'string', description: 'Why the Harness should restart. Shown in the warning; ignored on the confirming call.' },
+        continuePrompt: { type: 'string', description: 'The self-contained instruction the resumed session receives after the restart. Shown in the warning; ignored on the confirming call.' },
+        resumeSubagents: { type: 'boolean', description: 'Wake the continuable subagents again after the resume. Defaults to the plugin setting.' },
+        confirmToken: { type: 'string', description: 'The token from the warning. Present only on the second, confirming call.' },
+      },
+      required: ['reason', 'continuePrompt'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          scheduled: { type: 'boolean' },
+          message: { type: 'string' },
+          confirmToken: { type: 'string' },
+          reason: { type: 'string' },
+          sessions: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['scheduled', 'message'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: value?.message ?? JSON.stringify(value) }],
+    },
+    async execute(args, exec) {
+      const callerId = exec?.agent?.id
+      if (typeof callerId !== 'string' || callerId === '') {
+        throw new Error('restart_dsh needs a session to restart from')
+      }
+      if (!isRootSession(ctx, callerId)) {
+        throw new Error('restart_dsh: only a top-level session may restart the Harness — a subagent must ask its parent to do it')
+      }
+
+      const confirmToken = typeof args?.confirmToken === 'string' ? args.confirmToken.trim() : ''
+
+      // ------------------------------------------------------------------
+      // FIRST CALL — warn, hand out the token, change nothing.
+      // ------------------------------------------------------------------
+      if (confirmToken === '') {
+        const reason = String(args?.reason ?? '').trim()
+        const continuePrompt = String(args?.continuePrompt ?? '').trim()
+        if (reason === '') throw new Error('restart_dsh needs a reason')
+        if (continuePrompt === '') throw new Error('restart_dsh needs a continuePrompt')
+        const sessions = await collectRestartTargets(ctx, callerId)
+        const token = randomUUID()
+        await writeRecord(settings, PENDING_FILE, {
+          createdAt: Date.now(),
+          token,
+          reason,
+          continuePrompt,
+          resumeSubagents: args?.resumeSubagents === undefined
+            ? settings.resumeSubagents !== false
+            : args.resumeSubagents === true,
+          sessions,
+          callerId,
+        })
+        return {
+          scheduled: false,
+          message: [
+            'NOT restarted anything yet.',
+            `Reason: ${reason}`,
+            `The instruction the fresh process will replay: ${continuePrompt}`,
+            `Sessions that will be resumed: ${sessions.length > 0 ? sessions.join(', ') : 'none'}`,
+            'Call restart_dsh again with confirmToken to perform exactly this restart.',
+          ].join('\n'),
+          confirmToken: token,
+          reason,
+          sessions,
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // SECOND CALL — execute the plan the warning showed.
+      // ------------------------------------------------------------------
+      const pending = await readRecord(settings, PENDING_FILE)
+      if (pending === undefined) {
+        throw new Error('there is no pending restart to confirm; call restart_dsh without a confirmToken to get a new warning')
+      }
+      if (pending.token !== confirmToken) {
+        throw new Error('the confirmation token does not match a pending restart; call restart_dsh again to get a new warning')
+      }
+      const age = Date.now() - Number(pending.createdAt ?? 0)
+      if (!Number.isFinite(age) || age < 0 || age > Number(settings.pendingTtlMs ?? DEFAULTS.pendingTtlMs)) {
+        await clearRecord(settings, PENDING_FILE)
+        throw new Error('the confirmation has expired; call restart_dsh again to get a new warning')
+      }
+
+      // The plan comes from the warning, not from this call's arguments.
+      const reason = String(pending.reason ?? '')
+      const continuePrompt = String(pending.continuePrompt ?? '')
+      const resumeSubagents = pending.resumeSubagents !== false
+      const planned = Array.isArray(pending.sessions) ? pending.sessions.map(String) : []
+      const sessions = planned.includes(callerId) ? planned : [callerId, ...planned]
+
+      await writeRecord(settings, HANDOFF_FILE, {
+        phase: 'prepared',
+        sessionId: callerId,
+        sessions: sessions.map(id => ({ id, kind: id === callerId ? 'initiator' : 'peer' })),
+        reason,
+        continuePrompt,
+        resumeSubagents,
+        createdAt: Date.now(),
+        createdByPid: process.pid,
+      })
+      // The confirmation is spent: it must not survive into the next process.
+      await clearRecord(settings, PENDING_FILE)
+
+      if (settings.dryRun === true) {
+        return {
+          scheduled: false,
+          message: `Dry run: the handoff record for "${reason}" was written, but this process was not signalled.`,
+          reason,
+          sessions,
+        }
+      }
+
+      scheduleRestart(ctx, settings, callerId, () => { exiting = true })
+      return {
+        scheduled: true,
+        message: `The Harness will restart now ("${reason}"). ${sessions.length} session(s) will be resumed and the instruction will be replayed.`,
+        reason,
+        sessions,
+      }
+    },
+  }
+}
+
+/**
+ * Arrange the exit: the current turn has to finish first.
+ *
+ * The tool must return its result BEFORE the process goes away, otherwise the
+ * model never learns that the restart happened. So the exit waits for the
+ * calling session to go idle — the turn is over, the tool result is in — and
+ * only then does the handoff record get its final word and the process get
+ * the signal.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {Record<string, any>} settings - effective plugin settings.
+ * @param {string} callerId - the session that asked for the restart.
+ * @param {() => void} onExit - called once, right before the signal.
+ * @returns {void} nothing.
+ */
+function scheduleRestart(ctx, settings, callerId, onExit) {
+  let done = false
+  const finish = () => {
+    if (done) return
+    done = true
+    void completeRestart(ctx, settings, callerId, onExit)
+  }
+  try {
+    ctx.on('agent/status', (payload) => {
+      if (payload?.agent?.id !== callerId) return
+      if (payload?.status !== 'idle') return
+      finish()
+    })
+  } catch (error) {
+    console.error('[restart-handoff] could not watch the agent status:', error)
+  }
+  const timeoutMs = Number(settings.idleTimeoutMs ?? DEFAULTS.idleTimeoutMs)
+  const timer = setTimeout(finish, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULTS.idleTimeoutMs)
+  // The timer must not hold the process open on its own.
+  if (typeof timer?.unref === 'function') timer.unref()
+}
+
+/**
+ * The last step before the exit: re-sample the sessions, flush the logs and
+ * signal this process.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
+ * @param {Record<string, any>} settings - effective plugin settings.
+ * @param {string} callerId - the session that asked for the restart.
+ * @param {() => void} onExit - called once, right before the signal.
+ * @returns {Promise<void>} resolves after the signal was sent.
+ */
+async function completeRestart(ctx, settings, callerId, onExit) {
+  try {
+    // The session list is re-sampled at the last moment: a session that
+    // started while the model was talking must come back too.
+    const record = await readRecord(settings, HANDOFF_FILE)
+    if (record !== undefined) {
+      const sessions = await collectRestartTargets(ctx, callerId)
+      const ids = sessions.length > 0 ? sessions : [callerId]
+      await writeRecord(settings, HANDOFF_FILE, {
+        ...record,
+        sessions: ids.map(id => ({ id, kind: id === callerId ? 'initiator' : 'peer' })),
+      })
+    }
+    const persistence = ctx.get?.('sessionPersistence') ?? ctx.sessionPersistence
+    await persistence?.flush?.()
+  } catch (error) {
+    console.error('[restart-handoff] could not prepare the restart:', error)
+  }
+  try {
+    onExit()
+  } catch (error) {
+    console.error('[restart-handoff] could not mark the exit:', error)
+  }
+  // SIGTERM is a supervisor's ordinary stop request: the CLI drains in-flight
+  // work and exits 0, and `Restart=always` brings a fresh process up.
+  console.error('[restart-handoff] signalling this process for restart')
+  process.kill(process.pid, 'SIGTERM')
 }
 
 /**
@@ -633,23 +984,29 @@ export function apply(ctx, config = {}) {
   // The handoff replay comes first and must never take the process down: a
   // broken registration must not cost the user the sessions they were waiting
   // for, and a failed resume must not stop the Harness from starting.
+  //
+  // The two recovery paths are CHAINED, not parallel: the handoff path
+  // resumes the sessions the planned restart recorded, and the unplanned path
+  // then scans for the sessions a crash left behind. The handoff's ids are
+  // handed over, so a session the handoff already resumed is never resumed
+  // twice — that would fight over the same write lease and deliver the same
+  // instruction twice.
   if (settings.autoResume !== false) {
     ctx.effect(() => {
       void runHandoff(ctx, settings)
+        .then((ids) => recoverUnplannedSessions(ctx, settings, ids ?? []))
         .catch((error) => {
-          console.error('[restart-handoff] handoff failed:', error)
-        })
-      void recoverUnplannedSessions(ctx, settings).catch((error) => {
-        console.error('[restart-handoff] unplanned recovery failed:', error)
-      })
-        .catch((error) => {
-          console.error('[restart-handoff] handoff failed:', error)
+          console.error('[restart-handoff] handoff or unplanned recovery failed:', error)
         })
     })
   }
 
   try {
-    if (typeof createRestartTool === 'function') ctx.tools.register(createRestartTool(ctx, settings))
+    // `typeof` guards the registration: a missing tool body must not take the
+    // whole plugin — and with it the guard and the replay — down.
+    if (typeof createRestartTool === 'function') {
+      ctx.effect(() => ctx.tools.register(createRestartTool(ctx, settings)))
+    }
   } catch (error) {
     console.error('[restart-handoff] could not register restart_dsh:', error)
   }
@@ -677,13 +1034,34 @@ export function apply(ctx, config = {}) {
  * Internals exported for the unit tests; not part of the plugin's contract.
  */
 export const internals = {
+  DEFAULTS,
+  HANDOFF_FILE,
+  PENDING_FILE,
+  collectRestartTargets,
+  collectStrings,
   createRestartGuard,
+  createRestartTool,
+  dangerousSegments,
+  hasPendingWork,
+  headVerb,
+  isCommandTool,
+  isResumableRoot,
+  isRootSession,
+  killsSelf,
+  lastRequestHeader,
+  listResumableSessions,
+  listSubagents,
+  readRecord,
   recoverUnplannedSessions,
   resumeSession,
+  routeFor,
   runHandoff,
+  selfKillSegments,
   teamMemberIds,
   wakeSubagents,
   wakeTeamMembers,
+  writeRecord,
+  clearRecord,
 }
 
 /**
@@ -739,7 +1117,7 @@ function lastRequestHeader(events) {
   const list = Array.isArray(events) ? events : []
   for (let index = list.length - 1; index >= 0; index -= 1) {
     const event = list[index]
-    if (event?.type !== 'request') continue
+    if (event?.type !== 'request/header') continue
     const header = event?.data?.header ?? event?.data
     if (header !== undefined && header !== null) return header
   }
@@ -758,10 +1136,11 @@ function lastRequestHeader(events) {
  */
 function routeFor(header, fallback) {
   const options = { ...(fallback ?? {}) }
-  if (header?.provider !== undefined) options.provider = header.provider
-  if (header?.model !== undefined) options.model = header.model
-  if (header?.reasoningEffort !== undefined && fallback?.adapterDefaults?.reasoningEffort !== true) {
-    options.reasoningEffort = header.reasoningEffort
+  const config = header?.config
+  if (config?.provider !== undefined) options.provider = config.provider
+  if (config?.model !== undefined) options.model = config.model
+  if (config?.reasoningEffort !== undefined && header?.adapterDefaults?.reasoningEffort !== true) {
+    options.reasoningEffort = config.reasoningEffort
   }
   return options
 }
