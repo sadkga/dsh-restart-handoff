@@ -225,6 +225,9 @@ because their argument runs exactly what a shell segment would.
 * **恢复是有上限的。** 一次启动最多恢复 `recoverMaxSessions` 个会话，且只恢复比 `recoverMaxAgeMs` 新的，最新的优先。年龄窗口在读日志之前用文件 mtime 判定，它严格比它所预判的规则更保守：刚刚被打断的会话绝不会被它滤掉。
 * **浏览器那一侧不是插件该管的事。** 宿主重启，页面短暂断连，前端会重新挂上。插件恢复的是**会话和工作**，不是页面的连接。
 * **`serviceUnit` 只是描述性的。** 重启是自我发信号，所以这个插件从不调用那个单元；这个名字只写进宣告退出的那行日志。真正把新进程拉起来的是单元自己的 `Restart=always`。
+* **恢复后的第一轮，会话的工具集可能比平时少几个。** 会话被恢复时拿到的是**那一刻**注册好的工具；有些插件的工具是注册在各自的 scope 里的（`ctx.inject(['schedule'], …)` 这种），要到这个 agent 的 scope 在第一轮装配完才补齐。实测：一个被恢复的会话第一轮带 123 个工具，下一轮就是完整的 153 个 —— 差的那 30 个是一个客户端插件、一个 MCP server 和一组提醒工具。
+  这不是本插件造成的（恢复路径与扫描路径都一样），也**改不了**：插件只能恢复会话，装配工具集是宿主的事。宿主会把它记成一条「工具已更新 · 移除 N 个」，下一轮就补上了。
+  本插件能做的是**等全局注册表安静下来再恢复**（`resumeSettleMs`），因为有些插件是在启动之后才注册自己的工具的；这消除了全局层面的竞争，但管不到 scope 层面那部分。
 
 ### 测试
 
@@ -606,6 +609,21 @@ Two known costs sit outside this plugin's reach:
   unit is never invoked by this plugin; the name is only written to the log
   line that announces the exit. The unit's own `Restart=always` is what
   actually brings the fresh process up.
+* **A resumed session's first turn can carry fewer tools than usual.** A
+  session is handed the tools that are registered at the moment it is
+  resumed, and some plugins register theirs in their own scope
+  (`ctx.inject(['schedule'], …)` and the like), which only joins the agent's
+  scope once its first turn is assembled. Measured: a resumed session came up
+  with 123 tools where the next turn had all 153 — the missing 30 belonging to
+  a client plugin, an MCP server and a set of reminder tools.
+  This is not the plugin's doing (the recovery path and the scan path behave
+  the same) and it cannot be changed from here: the plugin resumes sessions,
+  the Host assembles tool sets. The Host records it as "tools updated — 29
+  removed", and the next turn has them back.
+  What the plugin CAN do is wait for the global registry to go quiet before
+  resuming (`resumeSettleMs`), because some plugins register their tools
+  after the Host is up; that removes the global race, but it does not reach
+  the scope-level part.
 
 ## Tests
 
