@@ -954,6 +954,9 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     return []
   }
   const skipped = { noId: 0, child: 0, live: 0, replayed: 0 }
+  const scanStartedAt = Date.now()
+  let readMs = 0
+  let readCount = 0
   const recovered = []
   const maxAgeMs = Number(settings.recoverMaxAgeMs ?? DEFAULTS.recoverMaxAgeMs)
   const maxSessions = Number(settings.recoverMaxSessions ?? DEFAULTS.recoverMaxSessions)
@@ -1023,7 +1026,10 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     // balanced locally too, which keeps the verdict independent of the reader.
     let events
     try {
+      const readAt = Date.now()
       const snapshot = await query.readSession(id)
+      readMs += Date.now() - readAt
+      readCount += 1
       events = Array.isArray(snapshot?.events) ? snapshot.events : []
     } catch (error) {
       console.error(`[restart-handoff] could not read the session ${id}:`, error)
@@ -1075,7 +1081,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     recovered.push(id)
     console.error(`[restart-handoff] scan: ${id} restored (${cutOff.cutOff ? cutOff.reason : 'queued-work'}) woken=${woken.length} teammates=${wokenTeammates.length}`)
   }
-  console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length} skipped-live=${skipped.live} skipped-child=${skipped.child} skipped-replayed=${skipped.replayed} skipped-noId=${skipped.noId}`)
+  console.error(`[restart-handoff] scan: candidates=${records.length} restored=${recovered.length} skipped-live=${skipped.live} skipped-child=${skipped.child} skipped-replayed=${skipped.replayed} skipped-noId=${skipped.noId} took=${Date.now() - scanStartedAt}ms reads=${readCount} readMs=${readMs}`)
   return recovered
 }
 

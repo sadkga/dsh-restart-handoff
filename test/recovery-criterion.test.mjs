@@ -384,3 +384,46 @@ test('criterion: an archived session is not restored by the scan either', async 
   assert.deepEqual(recovered, [])
   assert.equal(calls.resumed.length, 0)
 })
+
+test('criterion: a fork seed is a root, not a subagent child', async () => {
+  // A fork carries `parentSession` but is an INDEPENDENT conversation:
+  // `origin` is the only subagent marker and `delegationDepth` stays 0.
+  // Measured on the live store: 21 fork seeds, every one of them previously
+  // skipped as if it were a child, so a cut-off fork was never recovered.
+  const { ctx, calls } = scanCtx([observation('fork', { kind: 'interrupted' })])
+  const realGet = ctx.get
+  ctx.get = (name) => {
+    if (name !== 'sessionQuery') return realGet(name)
+    return {
+      ...realGet(name),
+      listSessions: async () => [{
+        id: 'fork',
+        // Exactly the live shape: parentSession set, no origin, depth 0.
+        header: { id: 'fork', parentSession: 'parent-id', delegationDepth: 0, isSeeded: true },
+        live: false,
+      }],
+    }
+  }
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, ['fork'])
+  assert.equal(calls.resumed.length, 1)
+})
+
+test('criterion: a real subagent child is still skipped', async () => {
+  const { ctx, calls } = scanCtx([observation('child', { kind: 'interrupted' })])
+  const realGet = ctx.get
+  ctx.get = (name) => {
+    if (name !== 'sessionQuery') return realGet(name)
+    return {
+      ...realGet(name),
+      listSessions: async () => [{
+        id: 'child',
+        header: { id: 'child', origin: 'subagent', delegationDepth: 1, parentSession: 'root' },
+        live: false,
+      }],
+    }
+  }
+  const recovered = await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  assert.deepEqual(recovered, [])
+  assert.equal(calls.resumed.length, 0)
+})
