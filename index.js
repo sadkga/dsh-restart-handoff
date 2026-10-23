@@ -972,11 +972,29 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     }
     if (record?.live === true) {
       skipped.live += 1
-      // The session is up already, but a child of it may have been cut off by
-      // the same exit. Walk the children rather than skipping the whole tree.
+      // Being up now does not mean the restart left it alone: a human who
+      // opened the conversation right after the crash makes it live before the
+      // scan runs. So the log still decides whether this session has work in
+      // flight, and the wake-up is delivered either way.
+      const liveAgent = ctx.get('agents')?.get?.(id)
       const wokenChildren = await wakeSubagents(ctx, id, { reason: 'unexpected restart' })
-      const wokenTeammates = await wakeTeamMembers(ctx, ctx.get('agents')?.get?.(id), { reason: 'unexpected restart' })
-      console.error(`[restart-handoff] scan: ${id} skipped (already live) woken=${wokenChildren.length} teammates=${wokenTeammates.length}`)
+      const wokenTeammates = await wakeTeamMembers(ctx, liveAgent, { reason: 'unexpected restart' })
+      let nudged = false
+      // The log decides, and it is read through the same helper the subagent
+      // wake-up uses. NOT `cutOffReason`, which takes an EVENT ARRAY: passing a
+      // context there silently yields `{ cutOff: false }` and the nudge would
+      // never fire while the log looked perfectly healthy.
+      const verdict = await wasSessionCutOff(ctx, id)
+      if (verdict.cutOff && liveAgent !== undefined && typeof liveAgent.followup === 'function') {
+        try {
+          liveAgent.followup(userMessage('The Harness process went down unexpectedly. Your session is open again — continue the work that was in flight.'))
+          nudged = true
+          console.error(`[restart-handoff] scan: ${id} already live, told to continue (${verdict.reason})`)
+        } catch (error) {
+          console.error(`[restart-handoff] could not nudge the live session ${id}:`, error)
+        }
+      }
+      console.error(`[restart-handoff] scan: ${id} skipped (already live) woken=${wokenChildren.length} teammates=${wokenTeammates.length} nudged=${nudged}`)
       continue
     }
     if (alreadyResumed.includes(id)) {
