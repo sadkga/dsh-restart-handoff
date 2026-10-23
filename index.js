@@ -1251,7 +1251,7 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
     console.error('[restart-handoff] could not list the sessions:', error)
     return []
   }
-  const skipped = { noId: 0, child: 0, live: 0, replayed: 0, stale: 0, prefiltered: 0 }
+  const skipped = { noId: 0, child: 0, live: 0, replayed: 0, archived: 0, stale: 0, prefiltered: 0 }
   const scanStartedAt = Date.now()
   let readMs = 0
   let readCount = 0
@@ -1268,6 +1268,69 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
   }
   // Newest first: the cap must keep the sessions the user actually has open.
   records = [...records].sort((a, b) => (b?.header?.createdAt ?? 0) - (a?.header?.createdAt ?? 0))
+  // Phase 1 — the cheap filters that decide a session WITHOUT its log, in the
+  // decision order the loop below uses: an id check, the live flag (its branch
+  // has side effects and stays in the loop), the handoff replay set, the
+  // archive set, and one `stat` for the mtime pre-filter. Only the survivors
+  // reach the read.
+  const pendingReads = []
+  for (const record of records) {
+    const id = record?.id ?? record?.header?.id
+    if (typeof id !== 'string' || id === '') continue
+    // The order here mirrors the decision loop below exactly, so a session is
+    // counted under the SAME skip reason the serial scan would report: a
+    // subagent child is out before its mtime is ever looked at, which keeps
+    // `skipped-child` at its serial value and spares the `stat`.
+    const isSubagentChild = record?.header?.origin === 'subagent'
+      || (typeof record?.header?.delegationDepth === 'number' && record.header.delegationDepth > 0)
+    if (isSubagentChild) continue
+    if (record?.live === true) continue
+    if (alreadyResumed.includes(id)) {
+      skipped.replayed += 1
+      console.error(`[restart-handoff] scan: ${id} skipped (replayed by the handoff)`)
+      continue
+    }
+    if (archived?.has(id)) {
+      skipped.archived += 1
+      console.error(`[restart-handoff] scan: ${id} skipped (archived)`)
+      continue
+    }
+    // The stale window is decided from the log file's mtime BEFORE the log is
+    // read: reading it costs a full decompress-and-parse of every event, and
+    // most candidates on a real store are long dead. The pre-filter is strictly
+    // more conservative than the durable rule it pre-decides — see
+    // `staleByLogMtime` — so a session it skips would have been skipped below
+    // anyway, and a session interrupted a moment ago can never be skipped here.
+    const prefilter = await staleByLogMtime(id, record?.header?.cwd, Date.now(), maxAgeMs)
+    if (prefilter.stale) {
+      skipped.prefiltered += 1
+      console.error(`[restart-handoff] scan: ${id} skipped (older than the window, by mtime)`)
+      continue
+    }
+    pendingReads.push(id)
+  }
+  // Phase 2 — read those logs a few at a time. A read is pure, so overlapping
+  // them cannot change a verdict; `mapBounded` hands back one outcome per id in
+  // `pendingReads` order, which is the order phase 3 decides in. Only the READS
+  // are concurrent — resuming, waking and the `maxSessions` cap all stay in the
+  // serial loop below, because they have side effects and an order.
+  const readStartedAt = Date.now()
+  const readOutcomes = await mapBounded(pendingReads, SESSION_READ_CONCURRENCY, async (id) => {
+    const snapshot = await query.readSession(id)
+    return Array.isArray(snapshot?.events) ? snapshot.events : []
+  })
+  const eventsById = new Map()
+  for (let index = 0; index < pendingReads.length; index += 1) {
+    const id = pendingReads[index]
+    const outcome = readOutcomes[index]
+    readCount += 1
+    if (outcome?.ok === true) eventsById.set(id, outcome.value)
+    else {
+      eventsById.set(id, undefined)
+      console.error(`[restart-handoff] could not read the session ${id}:`, outcome?.error)
+    }
+  }
+  readMs = Date.now() - readStartedAt
   for (const record of records) {
     const id = record?.id ?? record?.header?.id
     if (typeof id !== 'string' || id === '') {
@@ -1320,42 +1383,16 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       console.error(`[restart-handoff] scan: ${id} skipped (already live) woken=${wokenChildren.length} teammates=${wokenTeammates.length} nudged=${nudged}`)
       continue
     }
-    if (alreadyResumed.includes(id)) {
-      skipped.replayed += 1
-      console.error(`[restart-handoff] scan: ${id} skipped (replayed by the handoff)`)
+    // Phase 1 has already decided the replay/archive/stale cases for this id,
+    // so reaching here means the log was read in phase 2. Take it from there:
+    // a missing entry is a read that failed, and it is reported once here.
+    const loaded = eventsById.get(id)
+    if (loaded === undefined) {
+      // Already logged by phase 2; the session is left alone, exactly as the
+      // serial `continue` on a failed read would have done.
       continue
     }
-    if (archived?.has(id)) {
-      console.error(`[restart-handoff] scan: ${id} skipped (archived)`)
-      continue
-    }
-    // The stale window is decided from the log file's mtime BEFORE the log is
-    // read: reading it costs a full decompress-and-parse of every event, and
-    // most candidates on a real store are long dead. The pre-filter is strictly
-    // more conservative than the durable rule it pre-decides — see
-    // `staleByLogMtime` — so a session it skips would have been skipped below
-    // anyway, and a session interrupted a moment ago can never be skipped here.
-    const prefilter = await staleByLogMtime(id, record?.header?.cwd, Date.now(), maxAgeMs)
-    if (prefilter.stale) {
-      skipped.prefiltered += 1
-      console.error(`[restart-handoff] scan: ${id} skipped (older than the window, by mtime)`)
-      continue
-    }
-    // The log is read with `readSession`, not `observeSession`: the latter
-    // returns a SEED view (a few events ending in `session/end-seed`), so a
-    // judgement built on it inspects the wrong conversation. The cause is
-    // balanced locally too, which keeps the verdict independent of the reader.
-    let events
-    try {
-      const readAt = Date.now()
-      const snapshot = await query.readSession(id)
-      readMs += Date.now() - readAt
-      readCount += 1
-      events = Array.isArray(snapshot?.events) ? snapshot.events : []
-    } catch (error) {
-      console.error(`[restart-handoff] could not read the session ${id}:`, error)
-      continue
-    }
+    const events = loaded
     const cutOff = cutOffReason(events)
     const wasCutOff = cutOff.cutOff
     // The inbox projection is the one thing the observation is still good
@@ -1774,8 +1811,10 @@ export const internals = {
   routeFor,
   runHandoff,
   selfKillSegments,
+  SESSION_READ_CONCURRENCY,
   staleByLogMtime,
   stillQueued,
+  mapBounded,
   teamMemberIds,
   wakeSubagents,
   wakeTeamMembers,
