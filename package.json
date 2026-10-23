@@ -1,6 +1,6 @@
 {
   "name": "dsh-restart-handoff",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "main": "./index.js",
   "description": "Restart the Harness itself and come back: a dedicated restart_dsh tool hands the session over to the next process, which resumes it, replays the pending instruction and wakes the subagents again.",
