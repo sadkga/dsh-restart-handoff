@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Restart Handoff",
+    "description": "Lets the model restart the Harness through one dedicated tool: the restart is recorded, the service comes back, and the fresh process resumes the session, replays the pending instruction and wakes the subagents again."
+  }
+}

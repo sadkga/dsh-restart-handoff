@@ -1,0 +1,8 @@
+- insert:
+    - id: restart-handoff
+      name: 'dsh-restart-handoff'
+      config:
+        serviceUnit: 'dsh.service'
+        autoResume: true
+        resumeSubagents: true
+        idleTimeoutMs: 30000
