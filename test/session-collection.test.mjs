@@ -141,6 +141,23 @@ test('the restart targets of a lone caller are the caller alone', async () => {
   assert.deepEqual(await collectRestartTargets(ctx, 'caller'), ['caller'])
 })
 
+test('resumeRunningSessions: false narrows the restart to the caller', async () => {
+  const ctx = ctxWith([
+    agent('caller'),
+    agent('busy', { status: 'running' }),
+    agent('queued', { nextTurn: 1 }),
+  ])
+  assert.deepEqual(await collectRestartTargets(ctx, 'caller', { resumeRunningSessions: false }), ['caller'])
+})
+
+test('resumeRunningSessions: true keeps the other sessions', async () => {
+  const ctx = ctxWith([
+    agent('caller'),
+    agent('busy', { status: 'running' }),
+  ])
+  assert.deepEqual(await collectRestartTargets(ctx, 'caller', { resumeRunningSessions: true }), ['caller', 'busy'])
+})
+
 test('a profile without the delegation runtime still collects sessions', async () => {
   const ctx = ctxWith([agent('busy', { status: 'running' })])
   assert.deepEqual(await listResumableSessions(ctx, 'other'), ['busy'])

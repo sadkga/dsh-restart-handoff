@@ -226,6 +226,18 @@ test('criterion: the recovered session is told what happened', async () => {
   assert.match(calls.followups[0].content[0].text, /went down unexpectedly/)
 })
 
+test('criterion: the wake-up message is a complete user message', async () => {
+  const { ctx, calls } = scanCtx([observation('s1', { kind: 'interrupted' })])
+  await recoverUnplannedSessions(ctx, { ...DEFAULTS }, [])
+  const message = calls.followups[0]
+  // The inbox's durable projection rejects a second message without a
+  // distinct id, so the identity is part of the contract, not a detail.
+  assert.equal(typeof message.id, 'string')
+  assert.ok(message.id.length > 0)
+  assert.equal(message.role, 'user')
+  assert.equal(message.source.kind, 'user')
+})
+
 test('criterion: the number of recovered sessions is capped', async () => {
   const observations = [
     observation('s1', { kind: 'interrupted' }),

@@ -30,20 +30,29 @@ import { readFile as fsReadFile, writeFile as fsWriteFile, mkdir as fsMkdir, ren
 
 import { randomUUID } from 'node:crypto'
 
-/** Plugin name the loader and the inventory show. */
-
-
-
-
-
-
-
+/**
+ * A user message for `agent.followup`.
+ *
+ * The shape is the host's `UserMessage`: an identity, a role, the content
+ * blocks and the source. The identity is not optional — the inbox's durable
+ * projection rejects a second message without a distinct id ("message
+ * "undefined" is already pending"), so two follow-ups into the same agent
+ * would fail without it.
+ * @param {string} text - the message text.
+ * @returns {Record<string, any>} the user message.
+ */
 function userMessage(text) {
-  return { role: 'user', content: [{ type: 'text', text: String(text) }] }
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text: String(text) }],
+    source: { kind: 'user' },
+  }
 }
 function handoffDir(settings) {
   return settings?.handoffDir ?? pathJoin(process.env.DSH_HOME ?? process.cwd(), 'restart')
 }
+/** Plugin name the loader and the inventory show. */
 export const name = 'restart-handoff'
 
 /**
@@ -88,10 +97,6 @@ const HANDOFF_FILE = 'handoff.json'
 const PENDING_FILE = 'pending.json'
 
 /**
- * Shell commands that would restart the Harness behind the tool's back. The
- * guard turns them into a denial that names the tool to use instead.
- */
-/**
  * Patterns that match a kill written inside a script, wherever it sits.
  * These are not commands of their own, so they are matched as text.
  */
@@ -106,7 +111,6 @@ const TEXT_RESTART_PATTERNS = [
 /** Verbs that kill processes; what they aim at only matters inside them. */
 const KILL_VERBS = new Set(['kill', 'pkill', 'killall', 'killall5'])
 
-/** Verbs that are dangerous whatever they are aimed at. */
 /** Verbs that are dangerous whatever they are aimed at. */
 const ALWAYS_DANGEROUS = new Set(['halt', 'init', 'telinit', 'reboot', 'shutdown', 'poweroff', 'taskkill', 'stop-process'])
 
@@ -429,17 +433,23 @@ async function listResumableSessions(ctx, callerId) {
 /**
  * The sessions a restart must bring back: the caller plus every other
  * session that is running, queued or has a live subagent.
+ *
+ * `resumeRunningSessions: false` narrows it to the caller alone — the other
+ * sessions are then left exactly as they were.
  * @param {import('@deepseek-ai/cordis').Context} ctx - the plugin context.
  * @param {string} callerId - the session that asked for the restart.
+ * @param {Record<string, any>} [settings] - effective plugin settings.
  * @returns {Promise<string[]>} the session ids, in registration order.
  */
-async function collectRestartTargets(ctx, callerId) {
+async function collectRestartTargets(ctx, callerId, settings = {}) {
   const roots = ctx.get('agents')?.roots?.() ?? []
   const ids = []
   for (const root of roots) {
     const id = root?.id
     if (typeof id !== 'string' || id === '') continue
-    if (id === callerId || await isResumableRoot(ctx, root)) ids.push(id)
+    if (id === callerId) { ids.push(id); continue }
+    if (settings.resumeRunningSessions === false) continue
+    if (await isResumableRoot(ctx, root)) ids.push(id)
   }
   return ids
 }
@@ -840,7 +850,7 @@ function createRestartTool(ctx, settings) {
         const continuePrompt = String(args?.continuePrompt ?? '').trim()
         if (reason === '') throw new Error('restart_dsh needs a reason')
         if (continuePrompt === '') throw new Error('restart_dsh needs a continuePrompt')
-        const sessions = await collectRestartTargets(ctx, callerId)
+        const sessions = await collectRestartTargets(ctx, callerId, settings)
         const token = randomUUID()
         await writeRecord(settings, PENDING_FILE, {
           createdAt: Date.now(),
@@ -975,7 +985,7 @@ async function completeRestart(ctx, settings, callerId, onExit) {
     // started while the model was talking must come back too.
     const record = await readRecord(settings, HANDOFF_FILE)
     if (record !== undefined) {
-      const sessions = await collectRestartTargets(ctx, callerId)
+      const sessions = await collectRestartTargets(ctx, callerId, settings)
       const ids = sessions.length > 0 ? sessions : [callerId]
       await writeRecord(settings, HANDOFF_FILE, {
         ...record,
@@ -994,7 +1004,7 @@ async function completeRestart(ctx, settings, callerId, onExit) {
   }
   // SIGTERM is a supervisor's ordinary stop request: the CLI drains in-flight
   // work and exits 0, and `Restart=always` brings a fresh process up.
-  console.error('[restart-handoff] signalling this process for restart')
+  console.error(`[restart-handoff] signalling this process for restart (unit: ${settings.serviceUnit ?? DEFAULTS.serviceUnit})`)
   process.kill(process.pid, 'SIGTERM')
 }
 
