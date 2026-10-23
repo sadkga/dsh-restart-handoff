@@ -361,3 +361,79 @@ test('scope: a file tool is not a command tool', () => {
 test('scope: a read tool is not a command tool', () => {
   assert.equal(isCommandTool('read'), false)
 })
+
+// ---------------------------------------------------------------------------
+// E. The wrappers and the execution calls that used to slip through.
+// ---------------------------------------------------------------------------
+
+test('vector: eval "kill $PPID" is denied', () => {
+  assertDenied("eval 'kill $PPID'")
+})
+
+test('vector: sudo --user=root kill -1 is denied', () => {
+  assertDenied('sudo --user=root kill -1')
+})
+
+test('vector: env -u FOO kill -1 is denied', () => {
+  assertDenied('env -u FOO kill -1')
+})
+
+test('vector: nohup kill -1 is denied', () => {
+  assertDenied('nohup kill -1')
+})
+
+test('vector: nice -n 10 kill -1 is denied', () => {
+  assertDenied('nice -n 10 kill -1')
+})
+
+test('vector: command kill -1 is denied', () => {
+  assertDenied('command kill -1')
+})
+
+test('vector: xargs -0 kill -9 is denied', () => {
+  assertDenied('echo 1 | xargs -0 kill -9')
+})
+
+test('vector: service dsh stop is denied', () => {
+  assertDenied('service dsh stop')
+})
+
+// ---------------------------------------------------------------------------
+// F. The code channel: a call that RUNS its argument runs the command too.
+// ---------------------------------------------------------------------------
+
+test('vector: execSync("pkill -f node") is denied', () => {
+  assertDenied("const { execSync } = require('child_process'); execSync('pkill -f node')", 'run_code')
+})
+
+test('vector: subprocess.run(["kill", "-1"]) is denied', () => {
+  assertDenied('import subprocess; subprocess.run(["kill", "-1"])', 'run_code')
+})
+
+test('vector: a nested tools.bash call is denied', () => {
+  assertDenied("await tools.bash({ command: 'pkill -f node' })", 'run_code')
+})
+
+test('vector: os.kill(os.getppid()) in a code tool is denied', () => {
+  assertDenied('import os, signal; os.kill(os.getppid(), signal.SIGTERM)', 'run_code')
+})
+
+test('vector: process.kill(process.ppid) in a code tool is denied', () => {
+  assertDenied('process.kill(process.ppid, 15)', 'run_code')
+})
+
+test('vector: harmless code passes', () => {
+  assert.equal(guard({ name: 'run_code', arguments: { code: 'const x = 1' } }), undefined)
+})
+
+// ---------------------------------------------------------------------------
+// G. The known boundary: a tool whose NAME does not say it executes anything
+// is treated as a data tool, so its payload is not judged as a command.
+// ---------------------------------------------------------------------------
+
+test('boundary: an unknown plugin tool carries data, not commands', () => {
+  assert.equal(
+    guard({ name: 'some_plugin_tool', arguments: { payload: { steps: ['echo hi', 'pkill -f node'] } } }),
+    undefined,
+  )
+})

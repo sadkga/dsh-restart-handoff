@@ -169,6 +169,31 @@ const COMMAND_TOOL_NAMES = /(?:^|[^a-z0-9])(?:bash|pwsh|sh|zsh|ksh|shell|termina
 const SELF_HARM_PATTERNS = TEXT_RESTART_PATTERNS.slice(0, 4)
 
 /**
+ * Calls whose argument is CODE THAT RUNS.
+ *
+ * A shell interpreter is the obvious case, but a code channel has its own
+ * equivalents: `execSync('pkill -f node')`, `subprocess.run(['kill','-1'])`,
+ * `os.system('reboot')` and `tools.bash({ command: 'pkill -f node' })` all run
+ * exactly what a shell segment would. Their payload is therefore parsed
+ * recursively, like an interpreter's.
+ */
+const EXECUTION_CALLS = /(?:\w+\.)*(?:exec|execsync|execfile|execfilesync|spawn|spawnsync|fork|system|popen|check_output|check_call|getoutput|run|call|eval|bash|zsh|pwsh|powershell)(?:\s*\.\s*\w+)*\s*\(/i
+
+/**
+ * The quoted strings inside a segment.
+ * @param {string} segment - one segment of a command line.
+ * @returns {string[]} the quoted payloads.
+ */
+function quotedPayloads(segment) {
+  const payloads = []
+  for (const quoted of segment.matchAll(/'([^']*)'|"([^"]*)"/g)) {
+    const payload = quoted[1] ?? quoted[2] ?? ''
+    if (payload !== '') payloads.push(payload)
+  }
+  return payloads
+}
+
+/**
  * The command a segment runs, with the wrappers peeled off.
  * @param {string} segment - one segment of a command line.
  * @returns {{ word: string, viaXargs: boolean }} the verb and whether xargs carried it.
@@ -199,8 +224,9 @@ function headVerb(segment) {
  *
  * A command line is split at the shell separators. A segment counts only when
  * it actually STARTS a dangerous verb and that verb is aimed at this machine:
- * a commit message mentioning "kill -1" is not a kill. An interpreter segment
- * is parsed recursively, because its payload is the real command.
+ * a commit message mentioning "kill -1" is not a kill. A segment whose head is
+ * an interpreter — or that CALLS an executor — is parsed recursively, because
+ * its payload is the real command.
  * @param {string} command - the command text.
  * @param {number} depth - recursion depth for interpreter payloads.
  * @returns {string[]} the dangerous segments.
@@ -213,11 +239,13 @@ function dangerousSegments(command, depth = 0) {
     const { word, viaXargs } = headVerb(segment)
     if (viaXargs && /\b(kill|pkill|killall5?)\b/.test(segment)) { found.push(segment); continue }
     if (ALWAYS_DANGEROUS.has(word)) { found.push(segment); continue }
-    if (INTERPRETERS.has(word) && depth < 2) {
-      for (const quoted of segment.matchAll(/'([^']*)'|"([^"]*)"/g)) {
-        const payload = quoted[1] ?? quoted[2] ?? ''
-        if (payload !== '') found.push(...dangerousSegments(payload, depth + 1))
-      }
+    if (depth < 2 && (INTERPRETERS.has(word) || EXECUTION_CALLS.test(segment))) {
+      const payloads = quotedPayloads(segment)
+      for (const payload of payloads) found.push(...dangerousSegments(payload, depth + 1))
+      // The payload of an array-style call is split across its items
+      // (`subprocess.run(['kill', '-1'])`), so the items are judged together
+      // as well as one by one.
+      if (payloads.length > 1) found.push(...dangerousSegments(payloads.join(' '), depth + 1))
       continue
     }
     if (!DANGEROUS_VERBS.has(word)) continue

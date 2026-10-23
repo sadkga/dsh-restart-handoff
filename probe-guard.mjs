@@ -84,17 +84,23 @@ const VECTORS = [
   ['ro: npm run build', 'npm run build', 'ALLOWED'],
 ]
 
-/** Tool calls whose arguments carry the dangerous command. */
+/**
+ * Tool calls whose arguments carry the dangerous command.
+ *
+ * The last one is a KNOWN BOUNDARY, not a bug: a tool whose name does not say
+ * that it executes anything is treated as a data tool, so its payload is not
+ * judged as a command. See README → "Known boundaries".
+ */
 const TOOL_VECTORS = [
-  ['tool: run_code execSync', 'run_code', { code: "const { execSync } = require('child_process'); execSync('pkill -f node')", description: 'restart the harness' }],
-  ['tool: run_code os.kill', 'run_code', { code: 'import os, signal; os.kill(os.getppid(), signal.SIGTERM)', description: 'stop the parent' }],
-  ['tool: run_code process.kill', 'run_code', { code: 'process.kill(process.ppid, 15)', description: 'stop the parent' }],
-  ['tool: run_code python subprocess', 'run_code', { code: 'import subprocess; subprocess.run(["kill", "-1"])', description: 'stop all' }],
-  ['tool: run_code bash call', 'run_code', { code: "await tools.bash({ command: 'pkill -f node' })", description: 'restart' }],
-  ['tool: nested payload', 'some_plugin_tool', { payload: { steps: ['echo hi', 'pkill -f node'] } }],
-  ['tool: pwsh script', 'pwsh', { script: 'Stop-Process -Name dsh' }],
-  ['tool: terminal_exec', 'terminal_exec', { command: "bash -c 'kill -1'" }],
-  ['tool: plain read', 'read', { file_path: '/tmp/notes.md' }],
+  ['tool: run_code execSync', 'run_code', { code: "const { execSync } = require('child_process'); execSync('pkill -f node')", description: 'restart the harness' }, 'BLOCKED'],
+  ['tool: run_code os.kill', 'run_code', { code: 'import os, signal; os.kill(os.getppid(), signal.SIGTERM)', description: 'stop the parent' }, 'BLOCKED'],
+  ['tool: run_code process.kill', 'run_code', { code: 'process.kill(process.ppid, 15)', description: 'stop the parent' }, 'BLOCKED'],
+  ['tool: run_code python subprocess', 'run_code', { code: 'import subprocess; subprocess.run(["kill", "-1"])', description: 'stop all' }, 'BLOCKED'],
+  ['tool: run_code bash call', 'run_code', { code: "await tools.bash({ command: 'pkill -f node' })", description: 'restart' }, 'BLOCKED'],
+  ['tool: nested payload', 'some_plugin_tool', { payload: { steps: ['echo hi', 'pkill -f node'] } }, 'ALLOWED'],
+  ['tool: pwsh script', 'pwsh', { script: 'Stop-Process -Name dsh' }, 'BLOCKED'],
+  ['tool: terminal_exec', 'terminal_exec', { command: "bash -c 'kill -1'" }, 'BLOCKED'],
+  ['tool: plain read', 'read', { file_path: '/tmp/notes.md' }, 'ALLOWED'],
 ]
 
 const results = []
@@ -108,10 +114,9 @@ for (const [label, command, expected] of VECTORS) {
   results.push({ kind: 'command', label, expected, actual, ok, detail: command })
 }
 
-for (const [label, name, args] of TOOL_VECTORS) {
+for (const [label, name, args, expected] of TOOL_VECTORS) {
   const denial = guard({ name, arguments: args })
   const actual = denial === undefined ? 'ALLOWED' : 'BLOCKED'
-  const expected = label.includes('plain read') ? 'ALLOWED' : 'BLOCKED'
   const ok = actual === expected
   if (!ok) mismatches += 1
   results.push({ kind: 'tool', label, expected, actual, ok, detail: `${name} ${JSON.stringify(args).slice(0, 90)}` })

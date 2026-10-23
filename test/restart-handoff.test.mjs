@@ -9,7 +9,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -19,6 +19,7 @@ const {
   DEFAULTS,
   PENDING_FILE,
   HANDOFF_FILE,
+  clearRecord,
   createRestartGuard,
   createRestartTool,
   hasPendingWork,
@@ -27,6 +28,7 @@ const {
   listResumableSessions,
   readRecord,
   routeFor,
+  writeRecord,
 } = internals
 
 /** The pending record's confirmation key, spelled so no secret scanner eats it. */
@@ -295,4 +297,132 @@ test('the guard still fires on a dangerous verb in command position', () => {
     assert.ok(typeof denial === 'string', `expected a denial for: ${command}`)
     assert.match(denial, /restart_dsh/)
   }
+})
+
+// ---------------------------------------------------------------------------
+// The confirmation's edges.
+// ---------------------------------------------------------------------------
+
+test('a token from another pending restart is refused', async () => {
+  const { dir, settings } = await fixture()
+  const tool = createRestartTool(fakeCtx({ roots: [fakeAgent('s1')] }), settings)
+  const warned = await tool.execute({ reason: 'why', continuePrompt: 'plan' }, { agent: fakeAgent('s1') })
+  // A second warning replaces the pending record; the old token dies with it.
+  const second = await tool.execute({ reason: 'why2', continuePrompt: 'plan2' }, { agent: fakeAgent('s1') })
+  assert.notEqual(second.confirmToken, warned.confirmToken)
+  await assert.rejects(
+    () => tool.execute({ reason: 'why', continuePrompt: 'plan', confirmToken: warned.confirmToken }, { agent: fakeAgent('s1') }),
+    /does not match a pending restart/,
+  )
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a confirmation without a pending record is refused', async () => {
+  const { dir, settings } = await fixture()
+  const tool = createRestartTool(fakeCtx({ roots: [fakeAgent('s1')] }), settings)
+  await assert.rejects(
+    () => tool.execute({ reason: 'why', continuePrompt: 'plan', confirmToken: 'anything' }, { agent: fakeAgent('s1') }),
+    /no pending restart/,
+  )
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('the pending record is spent by the confirmation', async () => {
+  const { dir, settings } = await fixture()
+  const tool = createRestartTool(fakeCtx({ roots: [fakeAgent('s1')] }), settings)
+  const warned = await tool.execute({ reason: 'why', continuePrompt: 'plan' }, { agent: fakeAgent('s1') })
+  await tool.execute({ reason: 'why', continuePrompt: 'plan', confirmToken: warned.confirmToken }, { agent: fakeAgent('s1') })
+  assert.equal(await readRecord(settings, PENDING_FILE), undefined)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('the handoff names the caller the initiator and the others peers', async () => {
+  const { dir, settings } = await fixture()
+  const tool = createRestartTool(fakeCtx({ roots: [fakeAgent('s1'), fakeAgent('s2', { status: 'running' })] }), settings)
+  const warned = await tool.execute({ reason: 'why', continuePrompt: 'plan' }, { agent: fakeAgent('s1') })
+  await tool.execute({ reason: 'why', continuePrompt: 'plan', confirmToken: warned.confirmToken }, { agent: fakeAgent('s1') })
+  const handoff = await readRecord(settings, HANDOFF_FILE)
+  assert.deepEqual(handoff.sessions, [{ id: 's1', kind: 'initiator' }, { id: 's2', kind: 'peer' }])
+  assert.equal(handoff.sessionId, 's1')
+  assert.equal(handoff.createdByPid, process.pid)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('the warning carries the plan that will be replayed', async () => {
+  const { dir, settings } = await fixture()
+  const tool = createRestartTool(fakeCtx({ roots: [fakeAgent('s1')] }), settings)
+  const warned = await tool.execute({ reason: 'because of the deploy', continuePrompt: 'deploy the api' }, { agent: fakeAgent('s1') })
+  assert.match(warned.message, /because of the deploy/)
+  assert.match(warned.message, /deploy the api/)
+  assert.match(warned.message, /NOT restarted anything yet/)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a restart without a reason is refused', async () => {
+  const { dir, settings } = await fixture()
+  const tool = createRestartTool(fakeCtx({ roots: [fakeAgent('s1')] }), settings)
+  await assert.rejects(
+    () => tool.execute({ reason: '  ', continuePrompt: 'plan' }, { agent: fakeAgent('s1') }),
+    /needs a reason/,
+  )
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a restart without a continuePrompt is refused', async () => {
+  const { dir, settings } = await fixture()
+  const tool = createRestartTool(fakeCtx({ roots: [fakeAgent('s1')] }), settings)
+  await assert.rejects(
+    () => tool.execute({ reason: 'why', continuePrompt: '' }, { agent: fakeAgent('s1') }),
+    /needs a continuePrompt/,
+  )
+  await rm(dir, { recursive: true, force: true })
+})
+
+// ---------------------------------------------------------------------------
+// The records on disk.
+// ---------------------------------------------------------------------------
+
+test('a record survives a round trip', async () => {
+  const { dir, settings } = await fixture()
+  await writeRecord(settings, HANDOFF_FILE, { phase: 'prepared', reason: 'because' })
+  const record = await readRecord(settings, HANDOFF_FILE)
+  assert.equal(record.phase, 'prepared')
+  assert.equal(record.reason, 'because')
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a missing record reads as undefined', async () => {
+  const { dir, settings } = await fixture()
+  assert.equal(await readRecord(settings, HANDOFF_FILE), undefined)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a broken record reads as undefined instead of throwing', async () => {
+  const { dir, settings } = await fixture()
+  await writeFile(join(dir, HANDOFF_FILE), 'not json at all', 'utf8')
+  assert.equal(await readRecord(settings, HANDOFF_FILE), undefined)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a record can be cleared', async () => {
+  const { dir, settings } = await fixture()
+  await writeRecord(settings, HANDOFF_FILE, { phase: 'prepared' })
+  await clearRecord(settings, HANDOFF_FILE)
+  assert.equal(await readRecord(settings, HANDOFF_FILE), undefined)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('clearing a record that is already gone is fine', async () => {
+  const { dir, settings } = await fixture()
+  await clearRecord(settings, HANDOFF_FILE)
+  assert.equal(await readRecord(settings, HANDOFF_FILE), undefined)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('a record is written atomically, leaving no temporary file behind', async () => {
+  const { dir, settings } = await fixture()
+  await writeRecord(settings, HANDOFF_FILE, { phase: 'prepared' })
+  const entries = await readdir(dir)
+  assert.deepEqual(entries, [HANDOFF_FILE])
+  await rm(dir, { recursive: true, force: true })
 })
