@@ -962,9 +962,11 @@ async function recoverUnplannedSessions(ctx, settings, alreadyResumed = []) {
       console.error('[restart-handoff] scan: <no id> skipped (no id)')
       continue
     }
-    if (record?.header?.parentSession !== undefined) {
+    const isSubagentChild = record?.header?.origin === 'subagent'
+      || (typeof record?.header?.delegationDepth === 'number' && record.header.delegationDepth > 0)
+    if (isSubagentChild) {
       skipped.child += 1
-      console.error(`[restart-handoff] scan: ${id} skipped (child session)`)
+      console.error(`[restart-handoff] scan: ${id} skipped (subagent child)`)
       continue
     }
     if (record?.live === true) {
