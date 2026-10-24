@@ -190,6 +190,37 @@ test('every session in the handoff is resumed and woken', async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
+test('the reason is not put into the model\'s message', async () => {
+  // The reason is an operator's detail. It belongs in the log, not in the
+  // instruction the model has to read — a parenthesis full of a sentence
+  // like "the OneDrive manifest cache was widened from 64 to 256 entries"
+  // tells the model nothing it can act on and crowds out what it can.
+  const { dir, settings } = await fixture()
+  await writeFile(join(dir, HANDOFF_FILE), JSON.stringify({
+    phase: 'prepared',
+    sessionId: 's-init',
+    sessions: [
+      { id: 's-init', kind: 'initiator' },
+      { id: 's-peer', kind: 'peer' },
+    ],
+    reason: 'because the manifest cache was widened from 64 to 256 entries',
+    continuePrompt: 'do the thing',
+    resumeSubagents: false,
+    createdAt: Date.now(),
+    createdByPid: 1,
+  }), 'utf8')
+  const { ctx, calls } = replayCtx()
+  await runHandoff(ctx, settings)
+
+  for (const followup of calls.followups) {
+    const text = followup.content[0].text
+    assert.match(text, /The Harness restarted\./, 'the message must still say what happened')
+    assert.doesNotMatch(text, /because the manifest cache/, 'the reason must not reach the model')
+    assert.doesNotMatch(text, /64 to 256/, 'not even a fragment of the reason')
+  }
+  await rm(dir, { recursive: true, force: true })
+})
+
 test('a teammate is woken once, by the Team path', async () => {
   const calls = { prompted: [], messaged: [] }
   const member = { id: 'm1', name: 'cap-models', role: 'teammate', status: 'inactive', diagnostics: [] }

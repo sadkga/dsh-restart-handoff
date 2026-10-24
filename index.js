@@ -860,8 +860,11 @@ async function runHandoff(ctx, settings) {
   const entries = Array.isArray(record.sessions) && record.sessions.length > 0
     ? record.sessions
     : [{ id: String(record.sessionId ?? ''), kind: 'initiator' }]
-  const reason = record.reason ?? 'no reason recorded'
-  const intro = `The Harness restarted (${reason}).`
+  // The reason is written to the log, not into the model's prompt. The
+  // message tells the model what happened; the reason is an operator's
+  // detail and only crowds the instruction the model has to read.
+  const intro = 'The Harness restarted.'
+  console.error(`[restart-handoff] replaying the handoff; reason: ${record.reason ?? 'no reason recorded'}`)
 
   const resumed = []
   const nudgedSessions = []
@@ -1006,7 +1009,7 @@ async function wakeSubagents(ctx, sessionId, record, alreadyWoken = new Set()) {
         delivery: 'queue',
         content: [{
           type: 'text',
-          text: `The Harness restarted (${record.reason ?? 'no reason recorded'}). The parent session was resumed and the pending work continues. Pick the work back up and finish it.`,
+          text: 'The Harness restarted. The parent session was resumed and the pending work continues. Pick the work back up and finish it.',
         }],
       }, AbortSignal.timeout(30_000))
       woken.push(child.id)
@@ -1084,7 +1087,7 @@ async function wakeTeamMembers(ctx, lead, record) {
         target: member.name,
         content: [{
           type: 'text',
-          text: `The Harness restarted (${record.reason ?? 'no reason recorded'}). The Lead session was resumed. Pick your work back up and finish it.`,
+          text: 'The Harness restarted. The Lead session was resumed. Pick your work back up and finish it.',
         }],
         signal: AbortSignal.timeout(30_000),
       })
